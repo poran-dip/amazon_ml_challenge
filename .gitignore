@@ -13,9 +13,13 @@ venv/
 
 # outputs
 /output/
+
+# intermediates
+/work/
+*.parquet
+*.npy
 *.pkl
 *.joblib
-*.csv
 
 # env
 .env
