@@ -330,40 +330,57 @@ TRIGRAM_MAX_CHARS = 48
 TRIGRAM_HASH_SEED = 0x9E3779B9
 
 
-def _trigrams(col: pl.Expr) -> pl.Expr:
-    """Overlapping character 3-grams of `col`, as a unique list of UInt32 hashes.
+def trigram_expression(col: str = "name_nospace") -> pl.Expr:
+    """Overlapping character 3-grams of a column, as a unique list of UInt32 hashes.
 
-    The string is padded with a leading and trailing space first. That does two
-    things: it gives the first and last real characters a boundary 3-gram, so
-    `acme` and `acmex` differ at the end as well as the start, and it means a
-    string shorter than three characters still produces grams instead of an
-    empty list. Without the padding a two-character name would have no 3-grams
-    at all and its similarity to anything would be a structural zero.
+    Takes a COLUMN NAME, not an expression, and that is the whole point.
 
-    Note the padded length is `len + 2`, so a core of length n yields exactly n
-    grams and `range(TRIGRAM_MAX_CHARS)` covers cores up to that many
-    characters.
+    The first version of this took an expression and was applied directly on
+    top of the `name_core` chain, which costs a `replace_many` accent pass, an
+    initialism glue, a token-wise abbreviation expansion and a legal-token
+    strip. Building 48 slices off that expression made polars recompute the
+    entire chain ONCE PER SLICE: measured 246.7s per million rows against
+    24.8s when the chain is materialized first. At 12.5M rows per split that
+    is 52 minutes of normalization instead of 5.
+
+    Requiring a column name makes the mistake unrepresentable — a caller has to
+    have materialized the input before it can name it. `main.prepare_full`
+    applies this in a second pass over `name_nospace`, which is exactly the
+    string these grams are wanted on.
     """
-    padded = pl.concat_str([pl.lit(" "), col.fill_null(""), pl.lit(" ")])
-    return (
-        pl.concat_list([padded.str.slice(i, 3) for i in range(TRIGRAM_MAX_CHARS)])
-        # Positions past the end of the string yield "" or a 1-2 character
-        # remainder. Keeping only length-3 pieces is what makes this a clean
-        # n-gram set rather than a ragged one.
-        #
-        # The modulo is deliberate rather than a plain cast: polars `hash`
-        # returns UInt64, and a strict narrowing cast to UInt32 errors on
-        # overflow while a non-strict one yields NULL — which would poison the
-        # set operations silently. Taking the low 32 bits explicitly is defined
-        # behaviour for every input.
-        .list.eval(
-            (
-                pl.element().filter(pl.element().str.len_chars() == 3)
-                .hash(seed=TRIGRAM_HASH_SEED) % 4294967296
-            ).cast(pl.UInt32)
+
+    padded = pl.concat_str([pl.lit(" "), pl.col(col).fill_null(""), pl.lit(" ")])
+    # Padded with a leading and trailing space: it gives the first and last
+    # real characters a boundary 3-gram, so `acme` and `acmex` differ at the
+    # end as well as the start, and a string shorter than three characters
+    # still produces grams instead of an empty list. The padded length is
+    # `len + 2`, so a string of length n yields exactly n grams and
+    # `range(TRIGRAM_MAX_CHARS)` covers inputs up to that many characters.
+    grams = []
+    for i in range(TRIGRAM_MAX_CHARS):
+        g = padded.str.slice(i, 3)
+        grams.append(
+            # Positions past the end yield "" or a 1-2 character remainder.
+            # Nulling those and dropping them afterwards is what makes this a
+            # clean n-gram set rather than a ragged one.
+            pl.when(g.str.len_chars() == 3)
+            # The modulo is deliberate rather than a plain cast: polars `hash`
+            # returns UInt64, and a strict narrowing cast to UInt32 errors on
+            # overflow while a non-strict one yields NULL — which would poison
+            # the set operations silently. Taking the low 32 bits explicitly is
+            # defined behaviour for every input.
+            .then((g.hash(seed=TRIGRAM_HASH_SEED) % 4294967296).cast(pl.UInt32))
+            .otherwise(None)
         )
-        .list.unique()
-    )
+    # `concat_list` + `drop_nulls` rather than `list.eval(...filter...)`.
+    # `list.eval` runs a per-row sub-query; this is 48 vectorized column
+    # operations instead, and measured 9.0s per million rows against 12.7s.
+    # Output is bit-identical — verified over a random corpus.
+    #
+    # `unique` is NOT optional: `features.py` computes union size as
+    # `|A| + |B| - |A and B|`, an identity that holds for sets and fails for
+    # multisets.
+    return pl.concat_list(grams).list.drop_nulls().list.unique()
 
 
 def _acronym(col: pl.Expr) -> pl.Expr:
@@ -390,12 +407,10 @@ def name_expressions(col: str = "business_name") -> list[pl.Expr]:
         core.str.replace_all(r"\s+", "").alias("name_nospace"),
         _acronym(core).alias("name_acronym"),
         core.str.split(" ").list.len().cast(pl.UInt16).alias("name_token_count"),
-        # Built on `name_core` with whitespace removed, so a word-order
-        # transposition ("coffee dent" / "dentcoffee") and a missing space cost
-        # only the grams that straddle the join rather than every gram in the
-        # string.
-        _trigrams(core.str.replace_all(r"\s+", "")).alias("name_trigrams"),
     ]
+    # NOTE: `name_trigrams` is deliberately NOT built here. It is applied in a
+    # second pass over the materialized `name_nospace` column — see
+    # `trigram_expression` for the 10x reason.
 
 
 def address_expressions(col: str = "business_address") -> list[pl.Expr]:

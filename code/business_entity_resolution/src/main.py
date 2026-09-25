@@ -279,7 +279,14 @@ if _UNKNOWN:
 # Adding them invalidates the normalized cache automatically — `_rule_mtime`
 # covers `text_norm.py` and this file, both of which changed — so no manual
 # `--force-normalize` is needed after this edit.
-_NAME_EXTRA: tuple[str, ...] = ("name_token_count", "name_trigrams")
+_NAME_EXTRA: tuple[str, ...] = ("name_token_count",)
+# Applied in a SECOND pass, over the materialized `name_nospace` column rather
+# than on top of the expression that produces it. Built inline with the others
+# it made polars recompute the whole `name_core` chain once per 3-gram slice —
+# 246.7s per million rows against 24.8s, which is 52 minutes of normalization
+# per split instead of 5. See `text_norm.trigram_expression`.
+_TRIGRAM_SOURCE = "name_nospace"
+_TRIGRAM_COLUMN = "name_trigrams"
 # `addr_postal` is a filtered subset of `addr_numbers` and both are kept. The
 # distinction is the whole point: a shared 6-digit postal code says two records
 # are in the same locality, while a shared 2-digit building number says they
@@ -296,8 +303,14 @@ if _COLLIDING:
 
 NORMALIZED_COLUMNS: tuple[str, ...] = (
     "entity_id", "country_norm",
-    *_NAME_KEYS, *_NAME_EXTRA, *_ADDR_KEYS, *_ADDR_EXTRA,
+    *_NAME_KEYS, *_NAME_EXTRA, _TRIGRAM_COLUMN, *_ADDR_KEYS, *_ADDR_EXTRA,
 )
+
+if _TRIGRAM_SOURCE not in NORMALIZED_COLUMNS:
+    raise ImportError(
+        f"the trigram pass reads {_TRIGRAM_SOURCE!r}, which the first "
+        "normalization pass does not produce."
+    )
 
 
 def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
@@ -322,13 +335,24 @@ def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
         *_pick(text_norm.name_expressions(), *_NAME_KEYS, *_NAME_EXTRA),
         *_pick(text_norm.address_expressions(), *_ADDR_KEYS, *_ADDR_EXTRA),
     ])
-    # Column order is load-bearing: every chunk is appended to the same parquet
-    # writer, and a schema that differs between chunks fails the write. Assert
-    # it here, where the message names the drift, rather than at the writer.
-    assert out.columns == list(NORMALIZED_COLUMNS), (
-        f"normalized columns drifted: {out.columns} != {list(NORMALIZED_COLUMNS)}"
+    # Second pass, on the MATERIALIZED frame. This is the whole performance
+    # fix: `trigram_expression` fans out into 48 slices, and building those on
+    # top of the `name_core` expression instead of its result recomputes that
+    # chain 48 times.
+    out = out.with_columns(
+        text_norm.trigram_expression(_TRIGRAM_SOURCE).alias(_TRIGRAM_COLUMN)
     )
-    return out
+    # Column order is load-bearing: every chunk is appended to the same parquet
+    # writer, and a schema that differs between chunks fails the write. The
+    # second pass appends its column at the end, so the order is restored by
+    # selecting rather than asserted into existence — and the set is checked
+    # first, so a missing or unexpected column names itself here rather than
+    # surfacing as a KeyError inside the select.
+    assert set(out.columns) == set(NORMALIZED_COLUMNS), (
+        f"normalized columns drifted: {sorted(out.columns)} != "
+        f"{sorted(NORMALIZED_COLUMNS)}"
+    )
+    return out.select(NORMALIZED_COLUMNS)
 
 
 # Stamped into the normalized parquet's arrow metadata and checked by
