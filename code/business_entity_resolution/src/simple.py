@@ -193,42 +193,24 @@ def load_prepared(
     10.3M rows at once holds the raw columns and the expression output at the
     same time. Each batch is reduced to three columns before the next is read.
 
-    `read_csv_batched` rather than `scan_csv(...).slice(...)` because a lazy
-    slice re-reads the file from the start for every chunk — 42 passes over a
-    10M-row TSV. This makes one sequential pass. Per the API, it needs
-    `schema_overrides` plus `infer_schema_length=0`; `scan_csv`'s `schema=` is
-    not accepted here.
+    The raw source is read once, then sliced in memory. Slicing a DataFrame is
+    a zero-copy view, so this is a real cursor. Two alternatives were rejected:
+    `scan_csv(...).slice(offset, chunk).collect()` in a loop re-reads the TSV
+    from the start every time — 42 passes over a 10M-row file — and
+    `read_csv_batched` is deprecated in current polars, while its replacement
+    `LazyFrame.collect_batches` does not exist in 1.18, is documented as
+    unstable, and warns that it is slower than the alternatives.
+
+    Peak memory is one raw source (~700MB for 5M rows of four short strings)
+    plus the narrow result, which is the same order the target key table
+    already occupied.
     """
-    reader = pl.read_csv_batched(
-        source_path(split, source, data),
-        separator="\t",
-        quote_char=None,
-        has_header=True,
-        schema_overrides={c: pl.Utf8 for c in SOURCE_COLUMNS},
-        infer_schema_length=0,
-        batch_size=chunk,
-    )
-    parts: list[pl.DataFrame] = []
-    seen = 0
-    while True:
-        batches = reader.next_batches(1)
-        if not batches:
-            break
-        for batch in batches:
-            # `--sample` limits the rows read, so the last batch is trimmed
-            # rather than the whole file being read and then cut.
-            if sample is not None and seen + batch.height > sample:
-                batch = batch.head(sample - seen)
-            seen += batch.height
-            if batch.height:
-                parts.append(prepare(batch, legacy, use_translit))
-            if sample is not None and seen >= sample:
-                break
-        if sample is not None and seen >= sample:
-            break
-    if not parts:
-        return prepare(scan_source(split, source, data, None).head(0).collect(),
-                       legacy, use_translit)
+    raw = scan_source(split, source, data, sample).collect()
+    parts = [
+        prepare(raw.slice(offset, chunk), legacy, use_translit)
+        for offset in range(0, max(raw.height, 1), chunk)
+    ]
+    del raw
     return pl.concat(parts, how="vertical")
 
 
