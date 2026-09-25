@@ -1,42 +1,57 @@
-"""End-to-end entity resolution pipeline.
+"""The entity resolution pipeline: the single entry point for every run.
 
-One file covering the whole path: read the data, block, score, predict, write
-both submission files, and self-score against the training ground truth.
-Deliberately lean on purpose — a working end-to-end pipeline before refining any
-stage.
+One file covering the whole path — read the data, normalize, block, score,
+predict, write both submission files, and self-score against the training
+ground truth. Every submission this project has made came from here, and every
+improvement lands here.
 
-    python -m src.simple --split train --sample 200000   # ~1 min smoke test
-    python -m src.simple --split train                   # full, self-scored
-    python -m src.simple --split test                    # writes submission
+    python -m src.main --split train --sample 200000   # ~1 min smoke test
+    python -m src.main --split train                   # full, self-scored
+    python -m src.main --split test                    # writes the submission
 
-Stages:
+Architecture
+------------
+The pipeline is five stages, each a single function with an explicit input and
+output, so a stage can be replaced without touching the ones around it:
 
-* normalize   romanize Indic script, fold accents, glue initialisms, expand
-              abbreviations, strip legal-form tokens (see `text_norm`)
-* block       exact match on (country, sorted `name_core` tokens)
-* score       Jaccard overlap of `addr_core` tokens
-* predict     keep pairs scoring >= --threshold, best --topk per entity
-* output      output/matching_results.tsv and output/candidate_pairs.tsv
-* evaluate    on train, macro F_0.5 against the ground truth
+* normalize   `prepare` — fold accents, glue initialisms, expand abbreviations,
+              strip legal-form tokens, optionally romanize Indic script. Rule
+              tables live in `text_norm`; edit data there, not code here.
+* block       `build_targets` — exact match on (country, sorted `name_core`
+              tokens), dropping keys whose bucket exceeds `--max-bucket`.
+* score       `_jaccard` — token-set overlap of `addr_core`.
+* predict     `generate` — keep pairs at or above `--threshold`, best `--topk`
+              per entity.
+* evaluate    `macro_f05` — macro F_0.5 plus the precision, recall and
+              empty-prediction diagnostics that say where to work next.
 
-Two flags exist so the normalization change is attributable rather than bundled:
-`--legacy-norm` restores the original lowercase-and-strip-punctuation behaviour,
-and `--translit` adds Indic romanization on top of the new rules. Measured on
-the full training split:
+That shape is what makes the next changes cheap. A second blocking key extends
+`build_targets`; a fuzzy candidate stage appends to the candidate set before
+`generate` filters it; a learned scorer replaces `_jaccard` and the threshold
+comparison with a model over several features. None of those requires
+restructuring the file.
+
+Measurement discipline
+----------------------
+Every change is measured against the run it replaces, one change at a time, and
+old behaviour is kept reachable behind a flag rather than deleted, so a
+regression can be isolated instead of bisected. `--legacy-norm` still reproduces
+the original normalization exactly. Measured on the full training split against
+a do-nothing floor of 0.0558:
 
     legacy                  0.4670    27s
     text_norm               0.6070   176s
     text_norm + translit    0.6075   302s
 
-Romanization is therefore off by default — see `--translit` for why.
+Romanization is off by default on that evidence — see `--translit`.
 
-Memory: Source 1 is streamed in chunks; the resident structure is the source-2/3
-key table, roughly 600MB-1GB at full scale. `--sample` runs on a slice for
-smaller machines.
-
-Each stage is a single clear step, so richer normalization, additional blocking
-keys, fuzzy candidate generation and a learned scorer each attach to one stage
-without changing the shape of the pipeline.
+Scale
+-----
+Roughly 12.5M rows per split. Sources are read once and normalized in slices;
+the resident structure is the source-2/3 key table, about 600MB-1GB at full
+scale, which fits comfortably in 16GB alongside one slice. `--sample` limits the
+entity side only, so a smoke test still matches against the full target set and
+its score stays meaningful.
 """
 
 from __future__ import annotations
@@ -50,8 +65,13 @@ import polars as pl
 from . import text_norm, translit
 
 SOURCE_COLUMNS = ["entity_id", "business_name", "business_address", "country"]
-# A key shared by more records than this carries no evidence and would emit a
-# huge number of useless pairs, so it is skipped.
+# A key shared by more records than this carries almost no evidence and would
+# emit a very large number of useless pairs, so its bucket is dropped.
+#
+# Set under the superseded normalization and not revisited since. `name_core`
+# strips legal-form tokens, which makes keys shorter and buckets larger: the
+# number of buckets dropped at this cap rose from 1,107 to 2,755 when the new
+# rules landed. Whether 100 is still the right cap is an open measurement.
 DEFAULT_MAX_BUCKET = 100
 
 
@@ -76,11 +96,17 @@ def ground_truth_path(data: Path) -> Path:
 # --------------------------------------------------------------------------
 
 def _clean_legacy(col: pl.Expr) -> pl.Expr:
-    """The original rule: lowercase, drop anything non-alphanumeric, collapse.
+    """The superseded rule: lowercase, drop anything non-alphanumeric, collapse.
 
-    Kept verbatim so `--legacy-norm` reproduces the 0.4670 run exactly. Note it
-    folds to `[^a-z0-9]`, which deletes every non-Latin character outright — an
-    Indic-script name normalizes to the empty string under this rule.
+    Retained as a measurement reference, not as a fallback. Keeping the previous
+    behaviour reachable is what lets `--legacy-norm` reproduce its 0.4670 run
+    bit-for-bit in the current checkout, so any future regression can be
+    attributed rather than bisected. It is not on any default path.
+
+    Its flaw is instructive and worth keeping visible: folding to `[^a-z0-9]`
+    deletes every non-Latin character outright, so an Indic-script name
+    normalizes to the empty string and roughly 1.5M target records were
+    unreachable by any key.
     """
     return (
         col.fill_null("")
@@ -417,7 +443,11 @@ def macro_f05(predictions: pl.DataFrame, data: Path, column: str) -> float:
 # --------------------------------------------------------------------------
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Minimal end-to-end ER baseline.")
+    p = argparse.ArgumentParser(
+        description="Business entity resolution: normalize, block, score, "
+                    "predict, write both submission files, and self-score on "
+                    "the training split."
+    )
     p.add_argument("--split", choices=("train", "test"), default="train")
     p.add_argument("--data-root", default=None, help="Folder containing dataset/")
     p.add_argument("--out-dir", default=None, help="Where the two TSVs go")
@@ -433,13 +463,19 @@ def main() -> None:
                    help="Max predicted matches per entity. Flat above 5 on the "
                         "training set; blocking rarely yields more.")
     p.add_argument("--threshold", type=float, default=0.15,
-                   help="Minimum address Jaccard to predict a match. Tuned on the "
-                        "full training split; see README for the sweep.")
+                   help="Minimum address Jaccard to predict a match. This value "
+                        "was tuned against the SUPERSEDED normalization; "
+                        "`addr_core` expands abbreviations and drops stopwords, "
+                        "so the Jaccard distribution has shifted and the "
+                        "optimum has moved by an unmeasured amount. The "
+                        "precision/recall figures printed after each training "
+                        "run indicate which direction.")
     p.add_argument("--chunk", type=int, default=250_000)
     p.add_argument("--legacy-norm", action="store_true",
-                   help="Restore the original lowercase-and-strip-punctuation "
-                        "normalization that scored 0.4670. Use it to re-measure "
-                        "the baseline in the same checkout as the new rules.")
+                   help="Reproduce the superseded lowercase-and-strip-punctuation "
+                        "normalization (0.4670) bit-for-bit. A measurement "
+                        "reference for attributing a regression to this stage, "
+                        "not a supported configuration.")
     p.add_argument("--translit", action="store_true",
                    help="Romanize Indic script before normalizing. OFF by "
                         "default: measured at +0.0005 macro F_0.5 for +126s on "
@@ -459,7 +495,7 @@ def main() -> None:
         mode = "legacy (lowercase + strip punctuation)"
     else:
         mode = "text_norm" + (" + romanization" if a.translit else " (no romanization)")
-    print(f"simple baseline [{a.split}]  data={data}")
+    print(f"entity resolution [{a.split}]  data={data}")
     print(f"  normalization: {mode}")
     if a.sample_targets:
         print("  WARNING: --sample-targets truncates the match universe, so the "
