@@ -1,3 +1,10 @@
 polars>=1.18,<2
 pyarrow>=15
 indic-transliteration>=2.3.68
+# Stage D. CPU-only, has Windows wheels, trains the ~5M-row sampled candidate
+# set in minutes inside 16GB. The challenge permits models up to 8B parameters
+# under MIT/Apache; a gradient-boosted tree ensemble is far inside that.
+lightgbm>=4.0,<5
+# Used directly by src.model for the feature matrix and the fold ensemble
+# average. polars does not require it, so it is declared rather than assumed.
+numpy>=1.24,<3
