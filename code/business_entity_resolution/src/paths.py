@@ -81,3 +81,18 @@ def partial_parquet(split: str, key: str, work: Path) -> Path:
 
 def candidates_parquet(split: str, work: Path) -> Path:
     return _sub(work, "candidates") / f"{split}_candidates.parquet"
+
+
+def features_parquet(split: str, work: Path) -> Path:
+    """One row per candidate pair, plus `label` on the training split."""
+    return _sub(work, "features") / f"{split}_features.parquet"
+
+
+def model_dir(work: Path) -> Path:
+    """Boosters, the feature-column manifest, and out-of-fold predictions.
+
+    Under `work/` rather than the repo: these are build artefacts of a
+    particular normalization and blocking configuration, not source, and
+    `work/` is already gitignored.
+    """
+    return _sub(work, "model")

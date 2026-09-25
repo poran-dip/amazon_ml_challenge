@@ -270,9 +270,47 @@ if _UNKNOWN:
         "prefix, so no expression builder supplies them."
     )
 
+# Columns the FEATURE stage needs that no blocking key asks for. They are
+# written here rather than recomputed per pair for the reason given in
+# `text_norm._trigrams`: an entity appears in ~10.7 candidates on average, so
+# per-entity work is an order of magnitude cheaper than per-pair work, and this
+# pass is already chunked and already cached.
+#
+# Adding them invalidates the normalized cache automatically — `_rule_mtime`
+# covers `text_norm.py` and this file, both of which changed — so no manual
+# `--force-normalize` is needed after this edit.
+_NAME_EXTRA: tuple[str, ...] = ("name_token_count",)
+# Applied in a SECOND pass, over the materialized `name_nospace` column rather
+# than on top of the expression that produces it. Built inline with the others
+# it made polars recompute the whole `name_core` chain once per 3-gram slice —
+# 246.7s per million rows against 24.8s, which is 52 minutes of normalization
+# per split instead of 5. See `text_norm.trigram_expression`.
+_TRIGRAM_SOURCE = "name_nospace"
+_TRIGRAM_COLUMN = "name_trigrams"
+# `addr_postal` is a filtered subset of `addr_numbers` and both are kept. The
+# distinction is the whole point: a shared 6-digit postal code says two records
+# are in the same locality, while a shared 2-digit building number says they
+# are at the same street address. Deriving one from the other in the feature
+# stage would put the 4-6 digit rule in two places.
+_ADDR_EXTRA: tuple[str, ...] = ("addr_token_count", "addr_numbers", "addr_postal")
+
+_COLLIDING = (set(_NAME_EXTRA) | set(_ADDR_EXTRA)) & (set(_NAME_KEYS) | set(_ADDR_KEYS))
+if _COLLIDING:
+    raise ImportError(
+        f"{sorted(_COLLIDING)} is both a blocking key and a feature column; "
+        "selecting it twice is a polars error."
+    )
+
 NORMALIZED_COLUMNS: tuple[str, ...] = (
-    "entity_id", "country_norm", *_NAME_KEYS, *_ADDR_KEYS,
+    "entity_id", "country_norm",
+    *_NAME_KEYS, *_NAME_EXTRA, _TRIGRAM_COLUMN, *_ADDR_KEYS, *_ADDR_EXTRA,
 )
+
+if _TRIGRAM_SOURCE not in NORMALIZED_COLUMNS:
+    raise ImportError(
+        f"the trigram pass reads {_TRIGRAM_SOURCE!r}, which the first "
+        "normalization pass does not produce."
+    )
 
 
 def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
@@ -294,16 +332,33 @@ def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
     out = df.select([
         pl.col("entity_id"),
         text_norm.country_expression(),
-        *_pick(text_norm.name_expressions(), *_NAME_KEYS),
-        *_pick(text_norm.address_expressions(), *_ADDR_KEYS),
+        *_pick(text_norm.name_expressions(), *_NAME_KEYS, *_NAME_EXTRA),
+        *_pick(text_norm.address_expressions(), *_ADDR_KEYS, *_ADDR_EXTRA),
     ])
-    # Column order is load-bearing: every chunk is appended to the same parquet
-    # writer, and a schema that differs between chunks fails the write. Assert
-    # it here, where the message names the drift, rather than at the writer.
-    assert out.columns == list(NORMALIZED_COLUMNS), (
-        f"normalized columns drifted: {out.columns} != {list(NORMALIZED_COLUMNS)}"
+    # Second pass, on the MATERIALIZED frame. This is the whole performance
+    # fix: `trigram_expression` fans out into 48 slices, and building those on
+    # top of the `name_core` expression instead of its result recomputes that
+    # chain 48 times.
+    out = out.with_columns(
+        text_norm.trigram_expression(_TRIGRAM_SOURCE).alias(_TRIGRAM_COLUMN)
     )
-    return out
+    # Column order is load-bearing: every chunk is appended to the same parquet
+    # writer, and a schema that differs between chunks fails the write. The
+    # second pass appends its column at the end, so the order is restored by
+    # selecting rather than asserted into existence — and the set is checked
+    # first, so a missing or unexpected column names itself here rather than
+    # surfacing as a KeyError inside the select.
+    assert set(out.columns) == set(NORMALIZED_COLUMNS), (
+        f"normalized columns drifted: {sorted(out.columns)} != "
+        f"{sorted(NORMALIZED_COLUMNS)}"
+    )
+    return out.select(NORMALIZED_COLUMNS)
+
+
+# Stamped into the normalized parquet's arrow metadata and checked by
+# `_is_fresh`. See the comment there for why a library version has to be part
+# of the cache key when a hash is part of the payload.
+POLARS_VERSION_KEY = b"amlc_polars_version"
 
 
 def _rule_mtime() -> float:
@@ -345,8 +400,20 @@ def _is_fresh(parquet: Path, source: Path, expected_rows: int | None) -> bool:
     try:
         import pyarrow.parquet as pq
 
-        rows = pq.ParquetFile(parquet).metadata.num_rows
+        pf = pq.ParquetFile(parquet)
+        rows = pf.metadata.num_rows
+        stamped = (pf.schema_arrow.metadata or {}).get(POLARS_VERSION_KEY, b"")
     except Exception:
+        return False
+    # `name_trigrams` holds polars hash values, and a hash is only meaningful
+    # against other hashes from the same polars build. Without this guard, a
+    # polars upgrade between two runs would leave source 1 cached under the old
+    # build and sources 2/3 written under the new one, at which point EVERY
+    # cross-source trigram comparison returns zero overlap — no crash, no
+    # warning, and a feature that silently becomes a constant. The mtime guards
+    # above cannot see this, because upgrading a library touches none of the
+    # files they watch.
+    if stamped.decode(errors="replace") != pl.__version__:
         return False
     return expected_rows is None or rows == expected_rows
 
@@ -403,6 +470,12 @@ def ensure_normalized(
                 if block.is_empty():
                     continue
                 table = prepare_full(block, use_translit).to_arrow()
+                # Stamp every chunk, not just the first: the writer is created
+                # from the first chunk's schema and pyarrow requires each
+                # subsequent table's schema to match it, metadata included.
+                table = table.replace_schema_metadata(
+                    {POLARS_VERSION_KEY: pl.__version__.encode()}
+                )
                 if writer is None:
                     writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
                 writer.write_table(table)
@@ -642,6 +715,64 @@ def generate_multi(
     )
 
 
+def generate_model(
+    split: str, data: Path, work: Path, topk: int, budget: int,
+    max_bucket: int | None, chunk: int, merge_buckets: int,
+    keys: tuple[str, ...] | None, reuse_candidates: bool,
+    acronym_cap: int | None, acronym_min_len: int,
+    coverage: float, folds: int, train_entities: int | None,
+    rounds: int, seed: int,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Multi-key blocking, then features, then the learned scorer.
+
+    The same blocking stage as `generate_multi` — only the scoring half
+    differs, which is what makes the two comparable. `generate_multi` ranks
+    candidates by address Jaccard and cuts at a threshold; this ranks them by a
+    model over ~30 features and cuts at a per-entity expected-F0.5 optimum.
+
+    Imports are function-local. `features` and `model` both import `paths` and
+    `blocking`, and `model` reaches back here for `write_submission` and
+    `macro_f05` when run as its own entry point, so a module-level import in
+    this direction would close a cycle. Confining it to the one function that
+    needs it keeps the rest of the module importable without LightGBM
+    installed, which also means `--scorer jaccard` still runs on a machine that
+    has not got it.
+    """
+    from . import features as feature_stage
+    from . import model as model_stage
+
+    cand_path = paths.candidates_parquet(split, work)
+    if reuse_candidates and cand_path.is_file():
+        print(f"  reusing {cand_path.name} (--reuse-candidates; "
+              "not checked against --budget/--keys/--max-bucket)")
+    else:
+        blocking.block_split(
+            split, work, budget, max_bucket, chunk, merge_buckets, keys,
+            acronym_cap, acronym_min_len,
+        )
+
+    print("  features:")
+    feature_stage.build_features(split, work, data, merge_buckets)
+    print("  model:")
+    matches = model_stage.run(
+        split, work, topk, coverage, folds, train_entities, rounds, seed
+    ).rename({"source1_entity_id": "entity_id"})
+
+    # The candidate file is the deliverable for `candidate_pairs.tsv`, which is
+    # a separate submission artefact from the matches and must list everything
+    # blocking reached, not everything the model kept.
+    cands = (
+        pl.scan_parquet(cand_path)
+        .select(
+            pl.col("source1_entity_id").alias("entity_id"),
+            pl.col("candidate_entity_id"),
+        )
+        .collect()
+    )
+    print(f"  candidates: {cands.height:,}   predicted matches: {matches.height:,}")
+    return cands, matches
+
+
 def write_submission(
     pairs: pl.DataFrame, split: str, data: Path, sample: int | None,
     out_path: Path, column: str,
@@ -825,6 +956,33 @@ def main() -> None:
                    help="Bucket cap for name_acronym alone. See src.blocking.")
     p.add_argument("--acronym-min-len", type=int, default=0,
                    help="Drop acronyms shorter than this. See src.blocking.")
+    p.add_argument("--scorer", choices=("jaccard", "model"), default="jaccard",
+                   help="jaccard (the 0.6070 configuration): rank candidates "
+                        "by address token overlap and cut at --threshold. "
+                        "model: LightGBM over the features in src.features, "
+                        "with a per-entity expected-F0.5 rule deciding how many "
+                        "to predict instead of a threshold. The default stays "
+                        "jaccard so a change here is attributable rather than "
+                        "silent; --scorer model is the one to run.")
+    p.add_argument("--coverage", type=float, default=1.0,
+                   help="--scorer model only. Share of true matches the "
+                        "candidate set contains, used to de-bias the recall "
+                        "term of the selection rule. src.block_eval reports it "
+                        "as macro recall (0.5956 at the last measurement); at "
+                        "the default of 1.0 the rule over-estimates recall and "
+                        "predicts slightly too few.")
+    p.add_argument("--folds", type=int, default=5,
+                   help="--scorer model only. Grouped CV folds over source-1 "
+                        "entities. Every entity is scored by the one fold "
+                        "model that did not train on it, so the reported "
+                        "F_0.5 has no in-sample component from the model.")
+    p.add_argument("--train-entities", type=int, default=500_000,
+                   help="--scorer model only. Entities sampled per fold for "
+                        "training. 0 uses all of them.")
+    p.add_argument("--rounds", type=int, default=600,
+                   help="--scorer model only. Boosting round ceiling; early "
+                        "stopping on an inner slice usually stops first.")
+    p.add_argument("--seed", type=int, default=13)
     p.add_argument("--force-normalize", action="store_true",
                    help="Rebuild the normalized parquet even if it looks "
                         "current. The cache is invalidated automatically when "
@@ -861,6 +1019,13 @@ def main() -> None:
     if a.legacy_norm and a.blocking == "multi":
         p.error("--legacy-norm reproduces the single-key 0.4670 run; pass "
                 "--blocking single with it.")
+    # The model reads the candidate parquet and the normalized parquet, neither
+    # of which the single-key path writes — it keeps everything in memory and
+    # emits one fused block key. Refuse the combination rather than supporting
+    # half of it, the same way --legacy-norm is handled above.
+    if a.scorer == "model" and a.blocking != "multi":
+        p.error("--scorer model reads the candidate and normalized parquet "
+                "that only --blocking multi produces.")
 
     started = time.perf_counter()
     if a.legacy_norm:
@@ -871,6 +1036,9 @@ def main() -> None:
     print(f"  normalization: {mode}")
     print(f"  blocking: {a.blocking}"
           + (f"  budget={a.budget}" if a.blocking == "multi" else ""))
+    print(f"  scorer: {a.scorer}"
+          + (f"  folds={a.folds}  coverage={a.coverage:g}"
+             if a.scorer == "model" else f"  threshold={a.threshold:g}"))
     if a.sample_targets:
         print("  WARNING: --sample-targets truncates the match universe, so the "
               "F_0.5 below understates the pipeline. Use it for memory, not "
@@ -888,11 +1056,19 @@ def main() -> None:
                   f"--split {a.split}` next)")
             return
         keys = tuple(k.strip() for k in a.keys.split(",")) if a.keys else None
-        cands, matches = generate_multi(
-            a.split, data, work, a.topk, a.threshold, a.budget,
-            a.max_bucket, a.chunk, a.merge_buckets, keys,
-            a.reuse_candidates, a.acronym_cap, a.acronym_min_len,
-        )
+        if a.scorer == "model":
+            cands, matches = generate_model(
+                a.split, data, work, a.topk, a.budget, a.max_bucket, a.chunk,
+                a.merge_buckets, keys, a.reuse_candidates, a.acronym_cap,
+                a.acronym_min_len, a.coverage, a.folds,
+                a.train_entities or None, a.rounds, a.seed,
+            )
+        else:
+            cands, matches = generate_multi(
+                a.split, data, work, a.topk, a.threshold, a.budget,
+                a.max_bucket, a.chunk, a.merge_buckets, keys,
+                a.reuse_candidates, a.acronym_cap, a.acronym_min_len,
+            )
     else:
         if a.normalize_only:
             p.error("--normalize-only applies to --blocking multi only.")

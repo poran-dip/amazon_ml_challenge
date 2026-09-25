@@ -83,6 +83,30 @@ KEY_SPECS: tuple[tuple[str, float, int], ...] = (
 
 KEY_COLUMNS: tuple[str, ...] = tuple(k for k, _, _ in KEY_SPECS)
 
+# Which key found a pair, as one bit per key in a `key_mask` column.
+#
+# The candidate file used to carry `n_keys` — how many keys agreed — but not
+# which ones, and that turned out to be the difference between a question that
+# can be measured and one that has to be argued. When multi-key blocking came
+# back with precision at 0.6702, the obvious question was what share of the
+# false positives arrived through `addr_sorted` alone, since those are exactly
+# the ones an address scorer cannot reject. It was unanswerable from the
+# artefact, and the failure mode had to be demonstrated on a hand-built example
+# instead of measured on the real 23.6M-pair candidate set.
+#
+# It is also a strictly stronger model feature than the count: "found by
+# name_sorted AND addr_sorted" is independent corroboration from two different
+# fields, while "found by two keys" could equally be name_sorted and
+# name_nospace, which are near-duplicates of each other.
+#
+# Bits are indexed against KEY_COLUMNS, not against the selected subset, so a
+# mask means the same thing across runs that pass different `--keys`.
+assert len(KEY_SPECS) <= 16, (
+    "key_mask is a UInt16 — widen the dtype in _emit_key and _merge before "
+    "adding a 17th blocking key."
+)
+KEY_BITS: dict[str, int] = {k: 1 << i for i, k in enumerate(KEY_COLUMNS)}
+
 # `name_core` is measured redundant and is excluded from blocking by default.
 # It contributed 0.00% unique true pairs under the superseded normalization AND
 # 0.00% again under the current one — two independent measurements, so this is
@@ -240,6 +264,9 @@ def _emit_key(
                     pl.lit(weight, dtype=pl.Float32)
                     / (pl.col("bucket_size").cast(pl.Float32) + 1.0).log(2.0)
                 ).alias("w"),
+                # Provenance. Constant within this key's partial, and OR-ed
+                # together across keys by the merge.
+                pl.lit(KEY_BITS[key], dtype=pl.UInt16).alias("key_bit"),
             )
             if hits.is_empty():
                 continue
@@ -291,7 +318,19 @@ def _merge(
             .group_by("source1_entity_id", "candidate_entity_id")
             .agg(
                 pl.col("w").sum().alias("block_score"),
-                pl.len().cast(pl.UInt8).alias("n_keys"),
+                # `n_unique` rather than `pl.len()`. The two are equal whenever
+                # each key emits a pair at most once, which holds as long as
+                # entity IDs are unique within sources 2 and 3 — but that is an
+                # assumption about the data, not about this code, and a
+                # duplicated target ID would silently inflate `n_keys` while
+                # leaving `key_mask` correct. Deriving both from the same bits
+                # makes them consistent by construction.
+                pl.col("key_bit").n_unique().cast(pl.UInt8).alias("n_keys"),
+                # Bitwise OR, expressed as a sum over the DISTINCT bits
+                # present. Each bit is a distinct power of two, so summing them
+                # once each is exactly an OR; `unique` is what makes that hold
+                # under a repeated emission rather than only in the happy case.
+                pl.col("key_bit").unique().sum().cast(pl.UInt16).alias("key_mask"),
             )
             .collect()
         )
@@ -405,7 +444,7 @@ def main() -> None:
         default=None,
         help="Comma-separated subset of keys, for attributing a change to one "
         f"key. Default: {','.join(DEFAULT_KEYS)}. Also available but off by "
-        "default because it measured 0.00% unique contribution twice: "
+        "default because it measured 0.00%% unique contribution twice: "
         f"{','.join(k for k in KEY_COLUMNS if k not in DEFAULT_KEYS)}",
     )
     p.add_argument(

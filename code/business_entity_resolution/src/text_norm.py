@@ -283,6 +283,106 @@ def _sorted_tokens(col: pl.Expr, drop_numeric: bool = False) -> pl.Expr:
     )
 
 
+# Character 3-grams are the feature stage's answer to the 23.74% of true pairs
+# that no exact key reaches. Those failures are character-level by construction
+# — typos (`fnesnius`/`fresenius`), concatenation (`dentcoffee`/`coffee dent`),
+# transliteration residue (`kanstraksans`/`constructions`), web debris (`com
+# jgsreal`/`jgs real`) — so they share most of their 3-grams while sharing no
+# token exactly.
+#
+# Built here, at normalization time, rather than in the feature stage. The
+# alternative is recomputing them for every candidate pair, and an entity
+# appears in ~10.7 candidates on average, so per-entity work is an order of
+# magnitude cheaper than per-pair work. Normalization is already chunked and
+# already cached, which is exactly what this needs.
+#
+# WHY THIS SHAPE: polars has no windowed string operation and the regex crate
+# has no lookaround, so overlapping n-grams cannot be produced by
+# `extract_all`. Unrolling into fixed slices is the vectorized way to do it —
+# `concat_list` of N slice expressions, then drop the partials. The cost is one
+# transient list of N elements per row, which is why this must stay inside the
+# chunked normalization pass and not be run over a whole source at once.
+#
+# The cap TRUNCATES: a `name_core` longer than this contributes no 3-grams past
+# the cut. Business names run to a median of 2-3 tokens, so 48 characters
+# covers essentially all of them, and truncation degrades the feature for the
+# tail rather than corrupting it.
+TRIGRAM_MAX_CHARS = 48
+
+# 3-grams are stored HASHED to UInt32, not as strings. Two reasons, both about
+# the 12.5M-row scale rather than about elegance:
+#
+# * memory — a resident List(String) of ~25 short strings per row costs roughly
+#   2.5GB across a split once per-string overhead is counted, against ~1.25GB
+#   for List(UInt32). The feature stage holds a target-side attribute table and
+#   a join output at the same time, and 16GB notices the difference.
+# * speed — `list.set_intersection` over integers is materially cheaper than
+#   over strings, and it runs on all 23.6M candidate pairs.
+#
+# Collisions are not a practical concern here: the measured 3-gram vocabulary
+# over this corpus is 15,285 distinct grams, so the expected number of 32-bit
+# collisions across the whole vocabulary is about 0.03.
+#
+# The hash is only ever compared against other hashes produced by the SAME
+# polars build, which is why `_is_fresh` in `main` now refuses a cache written
+# by a different polars version. Mixing versions across the three sources would
+# make every cross-source trigram comparison silently return zero overlap.
+TRIGRAM_HASH_SEED = 0x9E3779B9
+
+
+def trigram_expression(col: str = "name_nospace") -> pl.Expr:
+    """Overlapping character 3-grams of a column, as a unique list of UInt32 hashes.
+
+    Takes a COLUMN NAME, not an expression, and that is the whole point.
+
+    The first version of this took an expression and was applied directly on
+    top of the `name_core` chain, which costs a `replace_many` accent pass, an
+    initialism glue, a token-wise abbreviation expansion and a legal-token
+    strip. Building 48 slices off that expression made polars recompute the
+    entire chain ONCE PER SLICE: measured 246.7s per million rows against
+    24.8s when the chain is materialized first. At 12.5M rows per split that
+    is 52 minutes of normalization instead of 5.
+
+    Requiring a column name makes the mistake unrepresentable — a caller has to
+    have materialized the input before it can name it. `main.prepare_full`
+    applies this in a second pass over `name_nospace`, which is exactly the
+    string these grams are wanted on.
+    """
+
+    padded = pl.concat_str([pl.lit(" "), pl.col(col).fill_null(""), pl.lit(" ")])
+    # Padded with a leading and trailing space: it gives the first and last
+    # real characters a boundary 3-gram, so `acme` and `acmex` differ at the
+    # end as well as the start, and a string shorter than three characters
+    # still produces grams instead of an empty list. The padded length is
+    # `len + 2`, so a string of length n yields exactly n grams and
+    # `range(TRIGRAM_MAX_CHARS)` covers inputs up to that many characters.
+    grams = []
+    for i in range(TRIGRAM_MAX_CHARS):
+        g = padded.str.slice(i, 3)
+        grams.append(
+            # Positions past the end yield "" or a 1-2 character remainder.
+            # Nulling those and dropping them afterwards is what makes this a
+            # clean n-gram set rather than a ragged one.
+            pl.when(g.str.len_chars() == 3)
+            # The modulo is deliberate rather than a plain cast: polars `hash`
+            # returns UInt64, and a strict narrowing cast to UInt32 errors on
+            # overflow while a non-strict one yields NULL — which would poison
+            # the set operations silently. Taking the low 32 bits explicitly is
+            # defined behaviour for every input.
+            .then((g.hash(seed=TRIGRAM_HASH_SEED) % 4294967296).cast(pl.UInt32))
+            .otherwise(None)
+        )
+    # `concat_list` + `drop_nulls` rather than `list.eval(...filter...)`.
+    # `list.eval` runs a per-row sub-query; this is 48 vectorized column
+    # operations instead, and measured 9.0s per million rows against 12.7s.
+    # Output is bit-identical — verified over a random corpus.
+    #
+    # `unique` is NOT optional: `features.py` computes union size as
+    # `|A| + |B| - |A and B|`, an identity that holds for sets and fails for
+    # multisets.
+    return pl.concat_list(grams).list.drop_nulls().list.unique()
+
+
 def _acronym(col: pl.Expr) -> pl.Expr:
     """First letter of each token, e.g. 'international business machines' -> 'ibm'.
 
@@ -308,6 +408,9 @@ def name_expressions(col: str = "business_name") -> list[pl.Expr]:
         _acronym(core).alias("name_acronym"),
         core.str.split(" ").list.len().cast(pl.UInt16).alias("name_token_count"),
     ]
+    # NOTE: `name_trigrams` is deliberately NOT built here. It is applied in a
+    # second pass over the materialized `name_nospace` column — see
+    # `trigram_expression` for the 10x reason.
 
 
 def address_expressions(col: str = "business_address") -> list[pl.Expr]:
