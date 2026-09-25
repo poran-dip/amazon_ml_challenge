@@ -21,17 +21,32 @@ from pathlib import Path
 
 import polars as pl
 
-from . import config, io_utils, text_norm
+from . import config, io_utils, text_norm, translit
 
 # Raw text is kept alongside the normalized forms: some features (casing,
 # original punctuation, untouched digits) are only available pre-normalization.
 OUTPUT_COLUMNS = [
-    "entity_id", "source", "country", "country_norm",
+    "entity_id", "source", "country", "country_norm", "is_indic",
     "business_name", "name_norm", "name_core", "name_sorted",
     "name_nospace", "name_acronym", "name_token_count",
     "business_address", "addr_norm", "addr_core", "addr_sorted",
     "addr_numbers", "addr_postal", "addr_token_count",
 ]
+
+
+def romanize_batch(batch: pl.DataFrame) -> pl.DataFrame:
+    """Replace Indic script with romanized text before any cleaning runs.
+
+    Must happen first: the rule tables in `text_norm` are written against Latin
+    text, and the `is_indic` flag has to be captured before the evidence is
+    transliterated away.
+    """
+    return batch.with_columns(
+        translit.indic_flag_expr("business_name", "business_address").alias("is_indic"),
+    ).with_columns(
+        translit.romanize_series(batch["business_name"]).alias("business_name"),
+        translit.romanize_series(batch["business_address"]).alias("business_address"),
+    )
 
 
 def normalize_lazy(lf: pl.LazyFrame, source: int) -> pl.LazyFrame:
@@ -71,6 +86,7 @@ def normalize_source(
                     if remaining <= 0:
                         return rows
                     batch = batch.head(remaining)
+                batch = romanize_batch(batch)
                 out = batch.lazy().pipe(normalize_lazy, source).collect()
                 table = out.to_arrow()
                 if writer is None:

@@ -1,2 +1,3 @@
+indic-transliteration
 polars
 pyarrow

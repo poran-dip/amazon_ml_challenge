@@ -69,6 +69,13 @@ LEGAL_TOKENS: tuple[str, ...] = (
     "llp", "plc", "gmbh", "mbh", "ag", "sarl", "sas", "sa", "srl", "spa",
     "bv", "nv", "oy", "ab", "as", "aps", "kft", "sdn", "bhd", "pty",
     "the", "and", "of",
+    # Romanized Indic spellings of the same legal words. `प्राइवेट लिमिटेड` is
+    # the English "private limited" written phonetically, so after
+    # `translit.romanize` it arrives as praivet/limiteda rather than as any of
+    # the forms above. Variants cover transliterator output plus schwa handling.
+    "praivet", "praiveta", "praivate", "prive", "praibhet",
+    "limiteda", "limitad", "limitet", "limted",
+    "kampani", "kampeni", "korporesan", "inkarporeted",
 )
 
 # Street / locality abbreviations -> long form. Applied to addresses only.
@@ -131,7 +138,11 @@ ADDR_STOPWORDS: tuple[str, ...] = (
 # --------------------------------------------------------------------------
 
 _PUNCT = r"[^\p{L}\p{N}]+"
-_COMBINING = r"\p{M}+"
+# ONLY the Latin combining-diacritics block (U+0300-U+036F), never `\p{M}`.
+# In Indic scripts the vowel signs and virama are themselves marks, so a blanket
+# `\p{M}` strip deletes the vowels: डेवलपर्स -> डवलपरस, 33 chars down to 22.
+# This range also covers the dot-below/macron used by IAST transliteration.
+_COMBINING = r"[̀-ͯ]+"
 
 # Precomposed accented characters -> ASCII. Applied as one Aho-Corasick pass
 # (`str.replace_many`), which is a single scan regardless of table size. The
@@ -152,6 +163,19 @@ ACCENT_MAP: dict[str, str] = dict(zip(_ACCENT_SRC, _ACCENT_DST))
 ACCENT_MAP.update(
     {"æ": "ae", "œ": "oe", "ß": "ss", "þ": "th", "ð": "d", "ĳ": "ij"}
 )
+# IAST characters produced by `translit.romanize`, folded to bare ASCII. The
+# library emits these precomposed, so the combining-mark regex alone misses them.
+ACCENT_MAP.update({
+    "ā": "a", "ī": "i", "ū": "u", "ē": "e", "ō": "o",
+    "ṛ": "r", "ṝ": "r", "ṟ": "r", "ṙ": "r",
+    "ḷ": "l", "ḹ": "l", "ḻ": "l", "ḽ": "l",
+    "ṃ": "m", "ṁ": "m", "ṅ": "n", "ñ": "n", "ṇ": "n", "ṉ": "n", "ṋ": "n",
+    "ḥ": "h", "ḫ": "h",
+    "ṭ": "t", "ṯ": "t", "ṱ": "t",
+    "ḍ": "d", "ḏ": "d", "ḑ": "d",
+    "ś": "s", "ṣ": "s", "ṡ": "s",
+    "ḳ": "k", "ḵ": "k", "ġ": "g", "ḡ": "g", "ḃ": "b", "ṗ": "p", "ṽ": "v",
+})
 _ACCENT_KEYS = list(ACCENT_MAP)
 _ACCENT_VALS = [ACCENT_MAP[k] for k in _ACCENT_KEYS]
 

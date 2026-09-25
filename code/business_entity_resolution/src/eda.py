@@ -47,6 +47,79 @@ def basic_profile(frames: dict[int, pl.DataFrame]) -> None:
               f"addr toks: {df['addr_token_count'].median()}")
 
 
+def match_count_distribution(frames: dict[int, pl.DataFrame], gt_path: Path) -> None:
+    """How many matches each Source-1 entity has, and the do-nothing baseline.
+
+    Under F_0.5 an entity with no true matches scores a full 1.0 when you predict
+    an empty list. So the singleton rate IS the score of a submission that
+    predicts nothing for everyone — the floor any pipeline must beat.
+    """
+    _section("matches per Source-1 entity")
+    gt = (
+        io_utils.scan_ground_truth(gt_path)
+        .with_columns(
+            pl.when(pl.col("matched_entity_ids").fill_null("").str.strip_chars() == "")
+            .then(pl.lit(0, dtype=pl.UInt32))
+            .otherwise(
+                pl.col("matched_entity_ids").str.count_matches(",").cast(pl.UInt32) + 1
+            )
+            .alias("n_matches")
+        )
+        .select("source1_entity_id", "n_matches")
+        .collect()
+    )
+    total = gt.height
+    counts = gt["n_matches"]
+    singletons = (counts == 0).sum()
+
+    print(f"entities in ground truth : {total:,}")
+    print(f"total true pairs         : {counts.sum():,}")
+    print(f"SINGLETONS (0 matches)   : {singletons:,} ({singletons / total:.2%})")
+    print(f"  -> predicting nothing for everyone scores F_0.5 = {singletons / total:.4f}")
+    print(f"     (that is the floor; any pipeline must beat it)")
+    print(f"mean matches (all)       : {counts.mean():.2f}")
+    non_zero = counts.filter(counts > 0)
+    if non_zero.len():
+        print(f"mean matches (non-empty) : {non_zero.mean():.2f}")
+        for q in (0.5, 0.9, 0.99, 1.0):
+            print(f"  q{q:<5} : {non_zero.quantile(q):.0f}")
+
+    hist = (
+        gt.group_by("n_matches").len().sort("n_matches").head(12)
+    )
+    print("  distribution:")
+    for row in hist.iter_rows(named=True):
+        print(f"    {row['n_matches']:>3} matches: {row['len']:>9,} "
+              f"({row['len'] / total:6.2%})")
+
+    # Coverage: is every Source-1 record represented in the ground truth?
+    s1_ids = set(frames[1]["entity_id"].to_list())
+    gt_ids = set(gt["source1_entity_id"].to_list())
+    missing = len(s1_ids - gt_ids)
+    print(f"source1 rows absent from ground truth: {missing:,}")
+
+
+def script_census(frames: dict[int, pl.DataFrame]) -> None:
+    """How much of each source arrived in a non-Latin script."""
+    _section("script mix (post-romanization flag)")
+    for source, df in frames.items():
+        if "is_indic" not in df.columns:
+            print(f"source{source}: no is_indic column — re-run normalize.")
+            continue
+        n = df.height
+        indic = df["is_indic"].sum()
+        print(f"source{source}: {indic:,} of {n:,} rows ({indic / n:.2%}) "
+              "contained Indic script")
+        by_country = (
+            df.group_by("country_norm")
+            .agg(pl.col("is_indic").mean().alias("indic_rate"), pl.len())
+            .sort("len", descending=True)
+        )
+        for row in by_country.iter_rows(named=True):
+            print(f"    {row['country_norm']:<10} {row['indic_rate']:6.2%} "
+                  f"of {row['len']:,}")
+
+
 def key_selectivity(frames: dict[int, pl.DataFrame]) -> None:
     """How many records share each candidate blocking key.
 
@@ -149,6 +222,8 @@ def main() -> None:
         frames[source] = lf.collect()
 
     basic_profile(frames)
+    match_count_distribution(frames, config.ground_truth_tsv(data))
+    script_census(frames)
     key_selectivity(frames)
     matched_pair_agreement(frames, config.ground_truth_tsv(data), None)
     disagreement_examples(frames, config.ground_truth_tsv(data),
