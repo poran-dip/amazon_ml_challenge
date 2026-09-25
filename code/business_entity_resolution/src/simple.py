@@ -114,7 +114,14 @@ def load_source(split: str, source: int, data: Path, sample: int | None) -> pl.L
 # --------------------------------------------------------------------------
 
 def build_targets(split: str, data: Path, sample: int | None, max_bucket: int) -> pl.DataFrame:
-    """Source 2 + 3, keyed for joining, with over-common keys removed."""
+    """Source 2 + 3, keyed for joining, with over-common keys removed.
+
+    `sample` here is `--sample-targets`, NOT `--sample`. Truncating the target
+    sources makes any score meaningless: a source-1 entity's true partners are
+    scattered anywhere across 10M target rows, so keeping only the first N
+    removes most of them from reach and the run measures the truncation rather
+    than the pipeline. Shrink the entity side instead.
+    """
     frames = [load_source(split, s, data, sample) for s in (2, 3)]
     targets = pl.concat(frames, how="vertical").collect()
     sizes = targets.group_by("block_key").len()
@@ -138,11 +145,11 @@ def _jaccard(a: pl.Expr, b: pl.Expr) -> pl.Expr:
 
 
 def generate(
-    split: str, data: Path, sample: int | None, max_bucket: int,
-    topk: int, threshold: float, chunk: int,
+    split: str, data: Path, sample: int | None, sample_targets: int | None,
+    max_bucket: int, topk: int, threshold: float, chunk: int,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Return (candidates, matches), one row per (source1, candidate) pair."""
-    targets = build_targets(split, data, sample, max_bucket)
+    targets = build_targets(split, data, sample_targets, max_bucket)
     s1 = load_source(split, 1, data, sample)
     n_s1 = s1.select(pl.len()).collect().item()
     print(f"  source1: {n_s1:,} entities")
@@ -263,7 +270,12 @@ def main() -> None:
     p.add_argument("--data-root", default=None, help="Folder containing dataset/")
     p.add_argument("--out-dir", default=None, help="Where the two TSVs go")
     p.add_argument("--sample", type=int, default=None,
-                   help="Use only the first N rows per source (fast smoke test).")
+                   help="Match only the first N Source-1 entities against the FULL "
+                        "target set. Fast smoke test with a meaningful score.")
+    p.add_argument("--sample-targets", type=int, default=None,
+                   help="Also truncate Sources 2 and 3 to N rows each. Reduces "
+                        "memory, but removes most true partners from reach, so "
+                        "the reported F_0.5 understates the pipeline.")
     p.add_argument("--max-bucket", type=int, default=DEFAULT_MAX_BUCKET)
     p.add_argument("--topk", type=int, default=5,
                    help="Max predicted matches per entity (true mean is ~3.5).")
@@ -277,8 +289,13 @@ def main() -> None:
 
     started = time.perf_counter()
     print(f"simple baseline [{a.split}]  data={data}")
+    if a.sample_targets:
+        print("  WARNING: --sample-targets truncates the match universe, so the "
+              "F_0.5 below understates the pipeline. Use it for memory, not "
+              "for measurement.")
     cands, matches = generate(
-        a.split, data, a.sample, a.max_bucket, a.topk, a.threshold, a.chunk
+        a.split, data, a.sample, a.sample_targets, a.max_bucket,
+        a.topk, a.threshold, a.chunk
     )
     write_submission(cands, a.split, data, a.sample,
                      out / "candidate_pairs.tsv", "candidate_entity_ids")

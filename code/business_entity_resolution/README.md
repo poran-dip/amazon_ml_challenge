@@ -36,7 +36,9 @@ Country is folded into the blocking key rather than compared separately, which c
 
 ## Knobs
 
-`--threshold` is the address Jaccard floor and the most useful dial: F_0.5 weights precision twice as heavily as recall, so raising it often pays. `--topk` caps predictions per entity; the true mean is about 3.5 matches, so 5 is a reasonable start. `--max-bucket` controls how aggressively over-common name keys are discarded. `--sample` runs on a slice of each source for a fast iteration loop. `--chunk` sets how many source-1 entities are processed per pass.
+`--threshold` is the address Jaccard floor and the most useful dial: F_0.5 weights precision twice as heavily as recall, so raising it often pays. `--topk` caps predictions per entity; the true mean is about 3.5 matches, so 5 is a reasonable start. `--max-bucket` controls how aggressively over-common name keys are discarded. `--chunk` sets how many source-1 entities are processed per pass.
+
+`--sample N` matches only the first N Source-1 entities, against the **full** target set, so the reported F_0.5 stays representative — on a quarter of the entities it lands within a few thousandths of the full-run score. `--sample-targets N` additionally truncates Sources 2 and 3 to save memory, and prints a warning, because a Source-1 entity's true partners are scattered anywhere across 10M target rows: keeping only the first N puts most of them out of reach and the score then measures the truncation rather than the pipeline, in either direction.
 
 ## Memory
 
