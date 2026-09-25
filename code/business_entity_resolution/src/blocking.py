@@ -444,7 +444,7 @@ def main() -> None:
         default=None,
         help="Comma-separated subset of keys, for attributing a change to one "
         f"key. Default: {','.join(DEFAULT_KEYS)}. Also available but off by "
-        "default because it measured 0.00% unique contribution twice: "
+        "default because it measured 0.00%% unique contribution twice: "
         f"{','.join(k for k in KEY_COLUMNS if k not in DEFAULT_KEYS)}",
     )
     p.add_argument(
