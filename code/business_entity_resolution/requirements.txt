@@ -1,1 +1,2 @@
-polars
+polars==1.18.0
+indic-transliteration==2.3.82

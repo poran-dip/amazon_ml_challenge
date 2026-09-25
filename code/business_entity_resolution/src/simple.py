@@ -11,12 +11,19 @@ stage.
 
 Stages:
 
-* normalize   lowercase, strip punctuation, collapse whitespace
-* block       exact match on (country, sorted name tokens)
-* score       Jaccard overlap of address tokens
+* normalize   romanize Indic script, fold accents, glue initialisms, expand
+              abbreviations, strip legal-form tokens (see `text_norm`)
+* block       exact match on (country, sorted `name_core` tokens)
+* score       Jaccard overlap of `addr_core` tokens
 * predict     keep pairs scoring >= --threshold, best --topk per entity
 * output      output/matching_results.tsv and output/candidate_pairs.tsv
 * evaluate    on train, macro F_0.5 against the ground truth
+
+Two flags exist so the normalization change is attributable rather than bundled:
+`--legacy-norm` restores the original lowercase-and-strip-punctuation behaviour
+that scored 0.4670, and `--no-translit` keeps the new rules but skips
+romanization. Three runs therefore separate "better rules" from "cross-script
+recovery" instead of reporting one combined delta.
 
 Memory: Source 1 is streamed in chunks; the resident structure is the source-2/3
 key table, roughly 600MB-1GB at full scale. `--sample` runs on a slice for
@@ -34,6 +41,8 @@ import time
 from pathlib import Path
 
 import polars as pl
+
+from . import text_norm, translit
 
 SOURCE_COLUMNS = ["entity_id", "business_name", "business_address", "country"]
 # A key shared by more records than this carries no evidence and would emit a
@@ -61,7 +70,13 @@ def ground_truth_path(data: Path) -> Path:
 # normalization
 # --------------------------------------------------------------------------
 
-def _clean(col: pl.Expr) -> pl.Expr:
+def _clean_legacy(col: pl.Expr) -> pl.Expr:
+    """The original rule: lowercase, drop anything non-alphanumeric, collapse.
+
+    Kept verbatim so `--legacy-norm` reproduces the 0.4670 run exactly. Note it
+    folds to `[^a-z0-9]`, which deletes every non-Latin character outright — an
+    Indic-script name normalizes to the empty string under this rule.
+    """
     return (
         col.fill_null("")
         .str.to_lowercase()
@@ -71,7 +86,7 @@ def _clean(col: pl.Expr) -> pl.Expr:
     )
 
 
-def _sorted_tokens(col: pl.Expr) -> pl.Expr:
+def _sorted_tokens_legacy(col: pl.Expr) -> pl.Expr:
     """Order-invariant signature, so 'Acme Foods' == 'Foods Acme'."""
     return (
         col.str.split(" ")
@@ -82,8 +97,25 @@ def _sorted_tokens(col: pl.Expr) -> pl.Expr:
     )
 
 
-def load_source(split: str, source: int, data: Path, sample: int | None) -> pl.LazyFrame:
-    """Read one source TSV and attach the normalized columns.
+def _pick(exprs: list[pl.Expr], *names: str) -> list[pl.Expr]:
+    """Select aliased expressions from `text_norm` by their output name.
+
+    Only the two columns actually used are built. `name_expressions()` and
+    `address_expressions()` define six each, and materializing all twelve over
+    10.3M target rows costs several GB that is then immediately discarded —
+    which a 16GB machine feels. Raising rather than silently skipping a missing
+    name means a rename in `text_norm` fails loudly here instead of quietly
+    changing the blocking key.
+    """
+    by: dict[str, pl.Expr] = {e.meta.output_name(): e for e in exprs}
+    missing = [n for n in names if n not in by]
+    if missing:
+        raise KeyError(f"text_norm no longer emits {missing}; available: {sorted(by)}")
+    return [by[n] for n in names]
+
+
+def scan_source(split: str, source: int, data: Path, sample: int | None) -> pl.LazyFrame:
+    """Read one source TSV as raw text, with no normalization attached.
 
     `quote_char=None` matters: addresses contain stray quote characters and
     letting polars interpret them silently merges rows. Everything is read as
@@ -96,24 +128,118 @@ def load_source(split: str, source: int, data: Path, sample: int | None) -> pl.L
         has_header=True,
         schema={c: pl.Utf8 for c in SOURCE_COLUMNS},
     )
-    if sample:
-        lf = lf.head(sample)
-    name = _clean(pl.col("business_name"))
-    addr = _clean(pl.col("business_address"))
-    return lf.select(
+    return lf.head(sample) if sample else lf
+
+
+def prepare(df: pl.DataFrame, legacy: bool, use_translit: bool) -> pl.DataFrame:
+    """Raw rows -> (entity_id, block_key, addr).
+
+    Eager rather than lazy: romanization is a per-string Python call that needs
+    a materialized Series, so callers collect a chunk and hand it here.
+
+    Country is folded into the block key rather than compared separately. It
+    agrees on 100% of true training pairs, so it is a free hard partition that
+    removes all cross-country comparisons at no cost in recall. It is used as an
+    opaque label — never enumerated — because the test set contains France,
+    which appears nowhere in training.
+    """
+    if legacy:
+        name = _clean_legacy(pl.col("business_name"))
+        return df.select(
+            pl.col("entity_id"),
+            pl.concat_str([
+                _clean_legacy(pl.col("country")),
+                pl.lit("|"),
+                _sorted_tokens_legacy(name),
+            ]).alias("block_key"),
+            _clean_legacy(pl.col("business_address")).alias("addr"),
+        )
+
+    if use_translit:
+        # Romanize before any cleaning: `text_norm.ACCENT_MAP` folds the IAST
+        # diacritics this emits, so the order matters.
+        df = df.with_columns([
+            translit.romanize_series(df.get_column(c))
+            for c in ("business_name", "business_address")
+        ])
+
+    (name_sorted,) = _pick(text_norm.name_expressions(), "name_sorted")
+    (addr_core,) = _pick(text_norm.address_expressions(), "addr_core")
+    return df.select(
         pl.col("entity_id"),
-        # Country is folded into the key rather than compared separately.
-        pl.concat_str([_clean(pl.col("country")), pl.lit("|"), _sorted_tokens(name)])
-        .alias("block_key"),
-        addr.alias("addr"),
+        pl.concat_str([
+            text_norm.country_expression(),
+            pl.lit("|"),
+            name_sorted,
+        ]).alias("block_key"),
+        addr_core.alias("addr"),
+    ).filter(
+        # A row whose name normalizes to nothing would otherwise land in a
+        # single "<country>|" bucket shared by every such row — a spurious
+        # block, not a match. This filter is deliberately NOT applied on the
+        # legacy path so `--legacy-norm` stays bit-identical to the 0.4670 run.
+        ~pl.col("block_key").str.ends_with("|")
     )
+
+
+def load_prepared(
+    split: str, source: int, data: Path, sample: int | None,
+    legacy: bool, use_translit: bool, chunk: int,
+) -> pl.DataFrame:
+    """Read and normalize one source in batches, keeping only the narrow result.
+
+    Batching is about peak memory: romanization is a Python call that needs a
+    materialized Series, so normalization cannot stay lazy, and normalizing
+    10.3M rows at once holds the raw columns and the expression output at the
+    same time. Each batch is reduced to three columns before the next is read.
+
+    `read_csv_batched` rather than `scan_csv(...).slice(...)` because a lazy
+    slice re-reads the file from the start for every chunk — 42 passes over a
+    10M-row TSV. This makes one sequential pass. Per the API, it needs
+    `schema_overrides` plus `infer_schema_length=0`; `scan_csv`'s `schema=` is
+    not accepted here.
+    """
+    reader = pl.read_csv_batched(
+        source_path(split, source, data),
+        separator="\t",
+        quote_char=None,
+        has_header=True,
+        schema_overrides={c: pl.Utf8 for c in SOURCE_COLUMNS},
+        infer_schema_length=0,
+        batch_size=chunk,
+    )
+    parts: list[pl.DataFrame] = []
+    seen = 0
+    while True:
+        batches = reader.next_batches(1)
+        if not batches:
+            break
+        for batch in batches:
+            # `--sample` limits the rows read, so the last batch is trimmed
+            # rather than the whole file being read and then cut.
+            if sample is not None and seen + batch.height > sample:
+                batch = batch.head(sample - seen)
+            seen += batch.height
+            if batch.height:
+                parts.append(prepare(batch, legacy, use_translit))
+            if sample is not None and seen >= sample:
+                break
+        if sample is not None and seen >= sample:
+            break
+    if not parts:
+        return prepare(scan_source(split, source, data, None).head(0).collect(),
+                       legacy, use_translit)
+    return pl.concat(parts, how="vertical")
 
 
 # --------------------------------------------------------------------------
 # pipeline
 # --------------------------------------------------------------------------
 
-def build_targets(split: str, data: Path, sample: int | None, max_bucket: int) -> pl.DataFrame:
+def build_targets(
+    split: str, data: Path, sample: int | None, max_bucket: int,
+    legacy: bool, use_translit: bool, chunk: int,
+) -> pl.DataFrame:
     """Source 2 + 3, keyed for joining, with over-common keys removed.
 
     `sample` here is `--sample-targets`, NOT `--sample`. Truncating the target
@@ -122,8 +248,11 @@ def build_targets(split: str, data: Path, sample: int | None, max_bucket: int) -
     removes most of them from reach and the run measures the truncation rather
     than the pipeline. Shrink the entity side instead.
     """
-    frames = [load_source(split, s, data, sample) for s in (2, 3)]
-    targets = pl.concat(frames, how="vertical").collect()
+    targets = pl.concat(
+        [load_prepared(split, s, data, sample, legacy, use_translit, chunk)
+         for s in (2, 3)],
+        how="vertical",
+    )
     sizes = targets.group_by("block_key").len()
     keep = sizes.filter(pl.col("len") <= max_bucket).select("block_key")
     before = targets.height
@@ -147,16 +276,22 @@ def _jaccard(a: pl.Expr, b: pl.Expr) -> pl.Expr:
 def generate(
     split: str, data: Path, sample: int | None, sample_targets: int | None,
     max_bucket: int, topk: int, threshold: float, chunk: int,
+    legacy: bool, use_translit: bool,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Return (candidates, matches), one row per (source1, candidate) pair."""
-    targets = build_targets(split, data, sample_targets, max_bucket)
-    s1 = load_source(split, 1, data, sample)
-    n_s1 = s1.select(pl.len()).collect().item()
-    print(f"  source1: {n_s1:,} entities")
+    targets = build_targets(
+        split, data, sample_targets, max_bucket, legacy, use_translit, chunk
+    )
+    # Source 1 is normalized once, in one file pass, and held narrow — 2.2M rows
+    # of three short strings. The join below still runs in chunks, but they are
+    # slices of an in-memory frame rather than repeated reads of the TSV.
+    s1 = load_prepared(split, 1, data, sample, legacy, use_translit, chunk)
+    n_s1 = s1.height
+    print(f"  source1: {n_s1:,} entities with a usable block key")
 
     cand_parts, match_parts = [], []
     for offset in range(0, n_s1, chunk):
-        block = s1.slice(offset, chunk).collect()
+        block = s1.slice(offset, chunk)
         hits = block.join(targets, on="block_key", how="inner")
         if hits.is_empty():
             continue
@@ -189,7 +324,10 @@ def write_submission(
     Entities with no matches still need a row with an empty field — a missing
     entity is rejected outright by the scorer.
     """
-    all_s1 = load_source(split, 1, data, sample).select("entity_id").collect()
+    # Raw scan, not the normalized path: this only needs the ID list, and every
+    # source-1 entity must appear here whether or not its name normalized to
+    # anything blockable.
+    all_s1 = scan_source(split, 1, data, sample).select("entity_id").collect()
     grouped = (
         pairs.group_by("entity_id")
         .agg(pl.col("candidate_entity_id").unique().sort().alias("ids"))
@@ -284,20 +422,35 @@ def main() -> None:
                    help="Minimum address Jaccard to predict a match. Tuned on the "
                         "full training split; see README for the sweep.")
     p.add_argument("--chunk", type=int, default=250_000)
+    p.add_argument("--legacy-norm", action="store_true",
+                   help="Restore the original lowercase-and-strip-punctuation "
+                        "normalization that scored 0.4670. Use it to re-measure "
+                        "the baseline in the same checkout as the new rules.")
+    p.add_argument("--no-translit", dest="translit", action="store_false",
+                   help="Keep the new normalization rules but skip Indic "
+                        "romanization, separating 'better rules' from "
+                        "'cross-script recovery'. Ignored with --legacy-norm, "
+                        "which never romanized.")
     a = p.parse_args()
 
     data = Path(a.data_root).expanduser() if a.data_root else repo_root() / "student_resource"
     out = Path(a.out_dir).expanduser() if a.out_dir else repo_root() / "output"
 
     started = time.perf_counter()
+    if a.legacy_norm:
+        mode = "legacy (lowercase + strip punctuation)"
+    else:
+        mode = "text_norm" + (" + romanization" if a.translit else " (no romanization)")
     print(f"simple baseline [{a.split}]  data={data}")
+    print(f"  normalization: {mode}")
     if a.sample_targets:
         print("  WARNING: --sample-targets truncates the match universe, so the "
               "F_0.5 below understates the pipeline. Use it for memory, not "
               "for measurement.")
     cands, matches = generate(
         a.split, data, a.sample, a.sample_targets, a.max_bucket,
-        a.topk, a.threshold, a.chunk
+        a.topk, a.threshold, a.chunk,
+        a.legacy_norm, a.translit and not a.legacy_norm,
     )
     write_submission(cands, a.split, data, a.sample,
                      out / "candidate_pairs.tsv", "candidate_entity_ids")
