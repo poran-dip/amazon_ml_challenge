@@ -1,3 +1,6 @@
+faiss-cpu
 indic-transliteration
+numpy
 polars
 pyarrow
+scikit-learn

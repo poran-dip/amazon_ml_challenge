@@ -80,7 +80,22 @@ Key values whose source-2/3 bucket exceeds `--max-bucket` (default 100) are drop
 
 `src/block_eval.py` reports pair recall (the hard ceiling on downstream recall), macro recall (per entity then averaged, which is how F_0.5 is scored), the share of entities whose matches were *all* found — the only ones that can still score 1.0 — and the count of entities left under budget, which is the workload handed to stage B.
 
-Stage B, a fuzzy character-n-gram search over the entities stage A left short, is not built yet.
+`block_eval` also prints per-key diagnostics: for each key, how many true pairs it *agrees* on, how many survive the bucket cap (**usable**), what the cap therefore costs, and how many it finds that no other key finds (**unique**). A key with high agreement but no unique contribution is redundant; a key whose agreement is destroyed by the cap needs a higher `--max-bucket`, not a higher weight. The footer separates what stage A can reach from what is unreachable by any exact key at any cap — that residue is stage B's job and no rule change will touch it.
+
+### Stage B — fuzzy n-gram search
+
+```bash
+python -m src.fuzzy --split train
+python -m src.block_eval --split train --candidates <work>/candidates/train_candidates_final.parquet
+```
+
+Character 3-gram TF-IDF over `name_core`, reduced to 128 dense dimensions by truncated SVD (both fitted on a sample), L2-normalized so inner product is cosine, then one FAISS IVFPQ index per country. Top-k neighbours per Source-1 entity are filtered by `--min-sim`, merged with the stage A candidates, and the union is capped at the budget.
+
+This is what recovers the failures that are character-level by construction: typos (`fnesnius`/`fresenius`), concatenation (`dentcoffee`/`coffee dent`), and transliteration residue (`kanstraksans`/`constructions`). All share most of their character n-grams while sharing no token exactly, so no exact key can ever reach them.
+
+Embeddings are written to disk as memmaps and streamed into the index in chunks — holding 12.5M dense vectors in RAM would cost double-digit gigabytes. IVFPQ keeps only compressed codes resident, so a 6M-record country partition costs roughly 100MB rather than 3GB.
+
+Stage A scores are key-weight sums up to ~3.5 while fuzzy similarities are 0–1, so `--fuzzy-weight` scales cosine to sit below a solid multi-key hit but above a lone acronym collision.
 
 Later stages (features, training, prediction) land here as they are built.
 
