@@ -11,12 +11,24 @@ stage.
 
 Stages:
 
-* normalize   lowercase, strip punctuation, collapse whitespace
-* block       exact match on (country, sorted name tokens)
-* score       Jaccard overlap of address tokens
+* normalize   romanize Indic script, fold accents, glue initialisms, expand
+              abbreviations, strip legal-form tokens (see `text_norm`)
+* block       exact match on (country, sorted `name_core` tokens)
+* score       Jaccard overlap of `addr_core` tokens
 * predict     keep pairs scoring >= --threshold, best --topk per entity
 * output      output/matching_results.tsv and output/candidate_pairs.tsv
 * evaluate    on train, macro F_0.5 against the ground truth
+
+Two flags exist so the normalization change is attributable rather than bundled:
+`--legacy-norm` restores the original lowercase-and-strip-punctuation behaviour,
+and `--translit` adds Indic romanization on top of the new rules. Measured on
+the full training split:
+
+    legacy                  0.4670    27s
+    text_norm               0.6070   176s
+    text_norm + translit    0.6075   302s
+
+Romanization is therefore off by default — see `--translit` for why.
 
 Memory: Source 1 is streamed in chunks; the resident structure is the source-2/3
 key table, roughly 600MB-1GB at full scale. `--sample` runs on a slice for
@@ -34,6 +46,8 @@ import time
 from pathlib import Path
 
 import polars as pl
+
+from . import text_norm, translit
 
 SOURCE_COLUMNS = ["entity_id", "business_name", "business_address", "country"]
 # A key shared by more records than this carries no evidence and would emit a
@@ -61,7 +75,13 @@ def ground_truth_path(data: Path) -> Path:
 # normalization
 # --------------------------------------------------------------------------
 
-def _clean(col: pl.Expr) -> pl.Expr:
+def _clean_legacy(col: pl.Expr) -> pl.Expr:
+    """The original rule: lowercase, drop anything non-alphanumeric, collapse.
+
+    Kept verbatim so `--legacy-norm` reproduces the 0.4670 run exactly. Note it
+    folds to `[^a-z0-9]`, which deletes every non-Latin character outright — an
+    Indic-script name normalizes to the empty string under this rule.
+    """
     return (
         col.fill_null("")
         .str.to_lowercase()
@@ -71,7 +91,7 @@ def _clean(col: pl.Expr) -> pl.Expr:
     )
 
 
-def _sorted_tokens(col: pl.Expr) -> pl.Expr:
+def _sorted_tokens_legacy(col: pl.Expr) -> pl.Expr:
     """Order-invariant signature, so 'Acme Foods' == 'Foods Acme'."""
     return (
         col.str.split(" ")
@@ -82,8 +102,25 @@ def _sorted_tokens(col: pl.Expr) -> pl.Expr:
     )
 
 
-def load_source(split: str, source: int, data: Path, sample: int | None) -> pl.LazyFrame:
-    """Read one source TSV and attach the normalized columns.
+def _pick(exprs: list[pl.Expr], *names: str) -> list[pl.Expr]:
+    """Select aliased expressions from `text_norm` by their output name.
+
+    Only the two columns actually used are built. `name_expressions()` and
+    `address_expressions()` define six each, and materializing all twelve over
+    10.3M target rows costs several GB that is then immediately discarded —
+    which a 16GB machine feels. Raising rather than silently skipping a missing
+    name means a rename in `text_norm` fails loudly here instead of quietly
+    changing the blocking key.
+    """
+    by: dict[str, pl.Expr] = {e.meta.output_name(): e for e in exprs}
+    missing = [n for n in names if n not in by]
+    if missing:
+        raise KeyError(f"text_norm no longer emits {missing}; available: {sorted(by)}")
+    return [by[n] for n in names]
+
+
+def scan_source(split: str, source: int, data: Path, sample: int | None) -> pl.LazyFrame:
+    """Read one source TSV as raw text, with no normalization attached.
 
     `quote_char=None` matters: addresses contain stray quote characters and
     letting polars interpret them silently merges rows. Everything is read as
@@ -96,24 +133,100 @@ def load_source(split: str, source: int, data: Path, sample: int | None) -> pl.L
         has_header=True,
         schema={c: pl.Utf8 for c in SOURCE_COLUMNS},
     )
-    if sample:
-        lf = lf.head(sample)
-    name = _clean(pl.col("business_name"))
-    addr = _clean(pl.col("business_address"))
-    return lf.select(
+    return lf.head(sample) if sample else lf
+
+
+def prepare(df: pl.DataFrame, legacy: bool, use_translit: bool) -> pl.DataFrame:
+    """Raw rows -> (entity_id, block_key, addr).
+
+    Eager rather than lazy: romanization is a per-string Python call that needs
+    a materialized Series, so callers collect a chunk and hand it here.
+
+    Country is folded into the block key rather than compared separately. It
+    agrees on 100% of true training pairs, so it is a free hard partition that
+    removes all cross-country comparisons at no cost in recall. It is used as an
+    opaque label — never enumerated — because the test set contains France,
+    which appears nowhere in training.
+    """
+    if legacy:
+        name = _clean_legacy(pl.col("business_name"))
+        return df.select(
+            pl.col("entity_id"),
+            pl.concat_str([
+                _clean_legacy(pl.col("country")),
+                pl.lit("|"),
+                _sorted_tokens_legacy(name),
+            ]).alias("block_key"),
+            _clean_legacy(pl.col("business_address")).alias("addr"),
+        )
+
+    if use_translit:
+        # Romanize before any cleaning: `text_norm.ACCENT_MAP` folds the IAST
+        # diacritics this emits, so the order matters.
+        df = df.with_columns([
+            translit.romanize_series(df.get_column(c))
+            for c in ("business_name", "business_address")
+        ])
+
+    (name_sorted,) = _pick(text_norm.name_expressions(), "name_sorted")
+    (addr_core,) = _pick(text_norm.address_expressions(), "addr_core")
+    return df.select(
         pl.col("entity_id"),
-        # Country is folded into the key rather than compared separately.
-        pl.concat_str([_clean(pl.col("country")), pl.lit("|"), _sorted_tokens(name)])
-        .alias("block_key"),
-        addr.alias("addr"),
+        pl.concat_str([
+            text_norm.country_expression(),
+            pl.lit("|"),
+            name_sorted,
+        ]).alias("block_key"),
+        addr_core.alias("addr"),
+    ).filter(
+        # A row whose name normalizes to nothing would otherwise land in a
+        # single "<country>|" bucket shared by every such row — a spurious
+        # block, not a match. This filter is deliberately NOT applied on the
+        # legacy path so `--legacy-norm` stays bit-identical to the 0.4670 run.
+        ~pl.col("block_key").str.ends_with("|")
     )
+
+
+def load_prepared(
+    split: str, source: int, data: Path, sample: int | None,
+    legacy: bool, use_translit: bool, chunk: int,
+) -> pl.DataFrame:
+    """Read and normalize one source in batches, keeping only the narrow result.
+
+    Batching is about peak memory: romanization is a Python call that needs a
+    materialized Series, so normalization cannot stay lazy, and normalizing
+    10.3M rows at once holds the raw columns and the expression output at the
+    same time. Each batch is reduced to three columns before the next is read.
+
+    The raw source is read once, then sliced in memory. Slicing a DataFrame is
+    a zero-copy view, so this is a real cursor. Two alternatives were rejected:
+    `scan_csv(...).slice(offset, chunk).collect()` in a loop re-reads the TSV
+    from the start every time — 42 passes over a 10M-row file — and
+    `read_csv_batched` is deprecated in current polars, while its replacement
+    `LazyFrame.collect_batches` does not exist in 1.18, is documented as
+    unstable, and warns that it is slower than the alternatives.
+
+    Peak memory is one raw source (~700MB for 5M rows of four short strings)
+    plus the narrow result, which is the same order the target key table
+    already occupied.
+    """
+    raw = scan_source(split, source, data, sample).collect()
+    parts = [
+        prepare(raw.slice(offset, chunk), legacy, use_translit)
+        for offset in range(0, max(raw.height, 1), chunk)
+    ]
+    del raw
+    return pl.concat(parts, how="vertical")
 
 
 # --------------------------------------------------------------------------
 # pipeline
 # --------------------------------------------------------------------------
 
-def build_targets(split: str, data: Path, sample: int | None, max_bucket: int) -> pl.DataFrame:
+def build_targets(
+    split: str, data: Path, sample: int | None, max_bucket: int,
+    legacy: bool, use_translit: bool, chunk: int,
+) -> pl.DataFrame:
     """Source 2 + 3, keyed for joining, with over-common keys removed.
 
     `sample` here is `--sample-targets`, NOT `--sample`. Truncating the target
@@ -122,8 +235,11 @@ def build_targets(split: str, data: Path, sample: int | None, max_bucket: int) -
     removes most of them from reach and the run measures the truncation rather
     than the pipeline. Shrink the entity side instead.
     """
-    frames = [load_source(split, s, data, sample) for s in (2, 3)]
-    targets = pl.concat(frames, how="vertical").collect()
+    targets = pl.concat(
+        [load_prepared(split, s, data, sample, legacy, use_translit, chunk)
+         for s in (2, 3)],
+        how="vertical",
+    )
     sizes = targets.group_by("block_key").len()
     keep = sizes.filter(pl.col("len") <= max_bucket).select("block_key")
     before = targets.height
@@ -147,16 +263,22 @@ def _jaccard(a: pl.Expr, b: pl.Expr) -> pl.Expr:
 def generate(
     split: str, data: Path, sample: int | None, sample_targets: int | None,
     max_bucket: int, topk: int, threshold: float, chunk: int,
+    legacy: bool, use_translit: bool,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Return (candidates, matches), one row per (source1, candidate) pair."""
-    targets = build_targets(split, data, sample_targets, max_bucket)
-    s1 = load_source(split, 1, data, sample)
-    n_s1 = s1.select(pl.len()).collect().item()
-    print(f"  source1: {n_s1:,} entities")
+    targets = build_targets(
+        split, data, sample_targets, max_bucket, legacy, use_translit, chunk
+    )
+    # Source 1 is normalized once, in one file pass, and held narrow — 2.2M rows
+    # of three short strings. The join below still runs in chunks, but they are
+    # slices of an in-memory frame rather than repeated reads of the TSV.
+    s1 = load_prepared(split, 1, data, sample, legacy, use_translit, chunk)
+    n_s1 = s1.height
+    print(f"  source1: {n_s1:,} entities with a usable block key")
 
     cand_parts, match_parts = [], []
     for offset in range(0, n_s1, chunk):
-        block = s1.slice(offset, chunk).collect()
+        block = s1.slice(offset, chunk)
         hits = block.join(targets, on="block_key", how="inner")
         if hits.is_empty():
             continue
@@ -189,7 +311,10 @@ def write_submission(
     Entities with no matches still need a row with an empty field — a missing
     entity is rejected outright by the scorer.
     """
-    all_s1 = load_source(split, 1, data, sample).select("entity_id").collect()
+    # Raw scan, not the normalized path: this only needs the ID list, and every
+    # source-1 entity must appear here whether or not its name normalized to
+    # anything blockable.
+    all_s1 = scan_source(split, 1, data, sample).select("entity_id").collect()
     grouped = (
         pairs.group_by("entity_id")
         .agg(pl.col("candidate_entity_id").unique().sort().alias("ids"))
@@ -257,8 +382,35 @@ def macro_f05(predictions: pl.DataFrame, data: Path, column: str) -> float:
     )
     if df.height == 0:
         return 0.0
-    singles = (df["nt"] == 0).sum()
-    print(f"  scored {df.height:,} entities ({singles:,} singletons)")
+
+    # Diagnostics. F_0.5 alone cannot say which way a threshold should move:
+    # the same score can come from predicting too much or too little. Reporting
+    # macro precision and macro recall separately answers that in one run
+    # instead of a sweep. Precision is averaged over entities that predicted
+    # something and recall over entities that have something to find, since
+    # neither is defined on the other's empty case.
+    n = df.height
+    n_true_single = int((df["nt"] == 0).sum())
+    n_pred_empty = int((df["np"] == 0).sum())
+    # The expensive mistake: a real entity given an empty prediction scores a
+    # flat zero and no threshold change can rescue it without candidates.
+    n_missed = int(((df["np"] == 0) & (df["nt"] > 0)).sum())
+    scored_p = df.filter(pl.col("np") > 0)
+    scored_r = df.filter(pl.col("nt") > 0)
+    prec = float((scored_p["tp"] / scored_p["np"]).mean()) if scored_p.height else 0.0
+    rec = float((scored_r["tp"] / scored_r["nt"]).mean()) if scored_r.height else 0.0
+
+    print(f"  scored {n:,} entities ({n_true_single:,} true singletons, "
+          f"{n_true_single / n:.2%})")
+    print(f"  macro precision {prec:.4f} (over {scored_p.height:,} entities "
+          f"that predicted something)")
+    print(f"  macro recall    {rec:.4f} (over {scored_r.height:,} entities "
+          f"with a true match)")
+    print(f"  predicted empty {n_pred_empty:,} ({n_pred_empty / n:.2%}) — of "
+          f"which {n_missed:,} ({n_missed / n:.2%} of all entities) have real "
+          f"matches and score a flat zero")
+    print(f"  mean predicted {df['np'].mean():.2f} per entity vs "
+          f"{df['nt'].mean():.2f} true")
     return float(df["f"].mean())
 
 
@@ -284,20 +436,39 @@ def main() -> None:
                    help="Minimum address Jaccard to predict a match. Tuned on the "
                         "full training split; see README for the sweep.")
     p.add_argument("--chunk", type=int, default=250_000)
+    p.add_argument("--legacy-norm", action="store_true",
+                   help="Restore the original lowercase-and-strip-punctuation "
+                        "normalization that scored 0.4670. Use it to re-measure "
+                        "the baseline in the same checkout as the new rules.")
+    p.add_argument("--translit", action="store_true",
+                   help="Romanize Indic script before normalizing. OFF by "
+                        "default: measured at +0.0005 macro F_0.5 for +126s on "
+                        "the full training split, because exact-key blocking "
+                        "needs every token to agree and a partly-romanized name "
+                        "still differs on its Latin tokens. Its measured value "
+                        "is character-trigram similarity (0.000 -> 0.326 on "
+                        "cross-script pairs), which only pays once a fuzzy "
+                        "stage exists. Ignored with --legacy-norm.")
     a = p.parse_args()
 
     data = Path(a.data_root).expanduser() if a.data_root else repo_root() / "student_resource"
     out = Path(a.out_dir).expanduser() if a.out_dir else repo_root() / "output"
 
     started = time.perf_counter()
+    if a.legacy_norm:
+        mode = "legacy (lowercase + strip punctuation)"
+    else:
+        mode = "text_norm" + (" + romanization" if a.translit else " (no romanization)")
     print(f"simple baseline [{a.split}]  data={data}")
+    print(f"  normalization: {mode}")
     if a.sample_targets:
         print("  WARNING: --sample-targets truncates the match universe, so the "
               "F_0.5 below understates the pipeline. Use it for memory, not "
               "for measurement.")
     cands, matches = generate(
         a.split, data, a.sample, a.sample_targets, a.max_bucket,
-        a.topk, a.threshold, a.chunk
+        a.topk, a.threshold, a.chunk,
+        a.legacy_norm, a.translit and not a.legacy_norm,
     )
     write_submission(cands, a.split, data, a.sample,
                      out / "candidate_pairs.tsv", "candidate_entity_ids")
