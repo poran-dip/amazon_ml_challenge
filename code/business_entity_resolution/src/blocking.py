@@ -83,6 +83,20 @@ KEY_SPECS: tuple[tuple[str, float, int], ...] = (
 
 KEY_COLUMNS: tuple[str, ...] = tuple(k for k, _, _ in KEY_SPECS)
 
+# `name_core` is measured redundant and is excluded from blocking by default.
+# It contributed 0.00% unique true pairs under the superseded normalization AND
+# 0.00% again under the current one — two independent measurements, so this is
+# a property of the key and not of one rule set. It is fully subsumed by
+# `name_sorted`, which is the same token set in a canonical order. Dropping it
+# removed 91.8M raw pairs, about a fifth of the blocking work, at no cost in
+# recall.
+#
+# It stays in KEY_SPECS rather than being deleted so `src.block_eval` can keep
+# measuring it — the claim above is worth re-checking whenever the
+# normalization rules change, and that is impossible once the key is gone.
+# `--keys` puts it back.
+DEFAULT_KEYS: tuple[str, ...] = tuple(k for k in KEY_COLUMNS if k != "name_core")
+
 
 # --------------------------------------------------------------------------
 # key construction
@@ -100,21 +114,35 @@ def blocking_key(key: str) -> pl.Expr:
     ).alias("bk")
 
 
-def _usable(key: str) -> pl.Expr:
-    """Rows whose key value is present and non-empty.
+def _usable(key: str, min_len: int = 0) -> pl.Expr:
+    """Rows whose key value is present, non-empty and long enough to mean much.
 
     A row whose name normalizes to nothing would otherwise land in a single
     `<country>|` bucket shared with every other such row — a spurious block,
     not a match.
+
+    `min_len` exists for `name_acronym`, where key length and bucket size are
+    directly related: a two-letter acronym has a few hundred possible values
+    across millions of records and its buckets are enormous, while a six-letter
+    one is nearly unique. A flat bucket cap handles that badly — it throws away
+    the whole key's contribution for 54.77% of the true pairs it agrees on,
+    because the short values crowd out the long ones. Dropping the short values
+    outright and then capping loosely targets the mechanism instead of the
+    symptom.
     """
-    return pl.col(key).is_not_null() & (pl.col(key).str.len_chars() > 0)
+    ok = pl.col(key).is_not_null() & (pl.col(key).str.len_chars() > 0)
+    if min_len > 1:
+        ok = ok & (pl.col(key).str.len_chars() >= min_len)
+    return ok
 
 
 # --------------------------------------------------------------------------
 # one key at a time
 # --------------------------------------------------------------------------
 
-def _target_table(split: str, work: Path, key: str, cap: int) -> pl.DataFrame:
+def _target_table(
+    split: str, work: Path, key: str, cap: int, min_len: int = 0
+) -> pl.DataFrame:
     """Source-2/3 side of one key, with over-large buckets removed.
 
     `bucket_size` is carried through rather than discarded: it becomes the
@@ -125,7 +153,7 @@ def _target_table(split: str, work: Path, key: str, cap: int) -> pl.DataFrame:
         [
             pl.scan_parquet(paths.normalized_parquet(split, s, work))
             .select("entity_id", "country_norm", key)
-            .filter(_usable(key))
+            .filter(_usable(key, min_len))
             .select(
                 pl.col("entity_id").alias("candidate_entity_id"), blocking_key(key)
             )
@@ -147,8 +175,9 @@ def _target_table(split: str, work: Path, key: str, cap: int) -> pl.DataFrame:
         .filter(pl.col("bucket_size") <= cap)
         .collect()
     )
+    note = f" (min len {min_len})" if min_len > 1 else ""
     print(
-        f"    {key:<14} targets {kept.height:>12,} rows   "
+        f"    {key:<14} targets {kept.height:>12,} rows{note}   "
         f"{n_dropped:,}/{n_buckets:,} buckets over cap {cap:,} dropped"
     )
     return kept
@@ -161,6 +190,7 @@ def _emit_key(
     weight: float,
     cap: int,
     chunk: int,
+    min_len: int = 0,
 ) -> Path | None:
     """Join source 1 against one key's target table, spill the hits to parquet.
 
@@ -170,7 +200,7 @@ def _emit_key(
     """
     import pyarrow.parquet as pq
 
-    targets = _target_table(split, work, key, cap)
+    targets = _target_table(split, work, key, cap, min_len)
 
     # Source 1, narrow and materialized once. Slicing a DataFrame is a
     # zero-copy view, so the chunk loop below is a real cursor. Repeatedly
@@ -180,7 +210,7 @@ def _emit_key(
     s1 = (
         pl.scan_parquet(paths.normalized_parquet(split, 1, work))
         .select("entity_id", "country_norm", key)
-        .filter(_usable(key))
+        .filter(_usable(key, min_len))
         .select(pl.col("entity_id").alias("source1_entity_id"), blocking_key(key))
         .collect()
     )
@@ -297,11 +327,19 @@ def block_split(
     chunk: int,
     merge_buckets: int,
     keys: tuple[str, ...] | None = None,
+    acronym_cap: int | None = None,
+    acronym_min_len: int = 0,
 ) -> Path:
     """Run stage A end to end and return the candidate parquet's path."""
-    specs = [s for s in KEY_SPECS if keys is None or s[0] in keys]
+    selected = keys if keys is not None else DEFAULT_KEYS
+    specs = [s for s in KEY_SPECS if s[0] in selected]
     if not specs:
         raise ValueError(f"no keys selected; available: {list(KEY_COLUMNS)}")
+    unknown = set(selected) - set(KEY_COLUMNS)
+    if unknown:
+        raise ValueError(
+            f"unknown keys {sorted(unknown)}; available: {list(KEY_COLUMNS)}"
+        )
 
     missing = [
         paths.normalized_parquet(split, s, work)
@@ -317,8 +355,13 @@ def block_split(
     started = time.perf_counter()
     partials: list[Path] = []
     for key, weight, cap in specs:
+        if key == "name_acronym":
+            cap = acronym_cap or cap
+            min_len = acronym_min_len
+        else:
+            min_len = 0
         partials.append(
-            _emit_key(split, work, key, weight, max_bucket or cap, chunk)
+            _emit_key(split, work, key, weight, max_bucket or cap, chunk, min_len)
         )
     partials = [p for p in partials if p is not None]
     if not partials:
@@ -360,8 +403,24 @@ def main() -> None:
     p.add_argument(
         "--keys",
         default=None,
-        help="Comma-separated subset of keys to use, for attributing a change "
-        f"to one key. Default is all of: {','.join(KEY_COLUMNS)}",
+        help="Comma-separated subset of keys, for attributing a change to one "
+        f"key. Default: {','.join(DEFAULT_KEYS)}. Also available but off by "
+        "default because it measured 0.00% unique contribution twice: "
+        f"{','.join(k for k in KEY_COLUMNS if k not in DEFAULT_KEYS)}",
+    )
+    p.add_argument(
+        "--acronym-cap", type=int, default=None,
+        help="Bucket cap for name_acronym alone (default: its KEY_SPECS value, "
+        "50). At that cap the key agrees on 60.58%% of true pairs but only "
+        "5.81%% survive, so the cap is discarding 54.77%% of what it finds.",
+    )
+    p.add_argument(
+        "--acronym-min-len", type=int, default=0,
+        help="Drop acronyms shorter than this before blocking on them. Bucket "
+        "size and acronym length are directly related, so this removes the "
+        "huge buckets at the source and lets --acronym-cap be loosened "
+        "without flooding the candidate set. Try `--acronym-min-len 4 "
+        "--acronym-cap 500` as a single designed experiment.",
     )
     p.add_argument("--chunk", type=int, default=250_000)
     p.add_argument(
@@ -375,15 +434,24 @@ def main() -> None:
 
     work = paths.work_root(a.work_root)
     keys = tuple(k.strip() for k in a.keys.split(",")) if a.keys else None
+    selected = keys if keys is not None else DEFAULT_KEYS
     caps = (
         f"global {a.max_bucket}"
         if a.max_bucket
-        else ", ".join(f"{k}={c}" for k, _, c in KEY_SPECS if keys is None or k in keys)
+        else ", ".join(
+            f"{k}={a.acronym_cap or c if k == 'name_acronym' else c}"
+            for k, _, c in KEY_SPECS
+            if k in selected
+        )
     )
     print(f"blocking [{a.split}]  work={work}  budget={a.budget}")
-    print(f"  bucket caps: {caps}")
+    print(f"  keys: {', '.join(selected)}")
+    print(f"  bucket caps: {caps}"
+          + (f"   acronym min len: {a.acronym_min_len}"
+             if a.acronym_min_len > 1 else ""))
     block_split(
-        a.split, work, a.budget, a.max_bucket, a.chunk, a.merge_buckets, keys
+        a.split, work, a.budget, a.max_bucket, a.chunk, a.merge_buckets, keys,
+        a.acronym_cap, a.acronym_min_len,
     )
 
 

@@ -71,7 +71,17 @@ def ground_truth_pairs(path: Path) -> pl.LazyFrame:
             .list.eval(pl.element().filter(pl.element().str.len_chars() > 0))
         )
         .explode("matched_entity_ids")
-        .filter(pl.col("matched_entity_ids").is_not_null())
+        # Filter on emptiness, not just nullness. A singleton's match list is
+        # an empty list, and `explode` currently turns that into one NULL row —
+        # but polars warns that in 2.0 `empty_as_null` defaults to False, at
+        # which point an `is_not_null()` filter alone would let a phantom
+        # empty-string "match" through for every singleton. That would inflate
+        # the true-pair count by the full 123,247 singletons and make every
+        # recall number here quietly wrong. Checking length covers both.
+        .filter(
+            pl.col("matched_entity_ids").is_not_null()
+            & (pl.col("matched_entity_ids").str.len_chars() > 0)
+        )
         .rename({"matched_entity_ids": "matched_entity_id"})
     )
 
@@ -157,8 +167,19 @@ def candidate_recall(
               f"(of {full_cross:,} possible pairs)")
 
     # Converts a blocking change into F_0.5 terms before any model exists.
-    # An upper bound and a loose one: it assumes a perfect classifier over the
-    # candidates, and F is concave in recall so averaging recall flatters it.
+    #
+    # Computed PER ENTITY, which matters. The first version of this counted
+    # only fully covered entities and singletons, giving every partially
+    # covered entity a flat zero — and reported 0.3044 as the "ceiling" for a
+    # candidate set whose pipeline already scored 0.6070. A ceiling below the
+    # achieved score is a bug report, not a number. An entity with 3 of its 5
+    # true matches found scores F_0.5 = 0.68 with a perfect classifier, not 0.
+    #
+    # With perfect precision, F_0.5 = 1.25r / (0.25 + r). Evaluating that per
+    # entity and then averaging is also what avoids the Jensen error in the
+    # other direction: F is concave in r, so plugging the MEAN recall into it
+    # overstates the mean F (0.8871 against the true 0.7943 on the first real
+    # run — a 9-point difference, larger than most changes being considered).
     #
     # Singletons must be counted from the ground truth file, NOT from
     # `per_entity`. An entity with no true matches explodes to zero rows and is
@@ -177,14 +198,25 @@ def candidate_recall(
         )
         .select(pl.len()).collect().item()
     )
-    ceiling = (singles + full) / max(s1_total, 1)
+    r = pl.col("n_found") / pl.col("n_true")
+    sum_f = float(
+        per_entity.select(
+            pl.when(pl.col("n_found") == 0)
+            .then(0.0)
+            .otherwise(1.25 * r / (0.25 + r))
+            .sum()
+        ).item()
+    )
+    ceiling = (singles * 1.0 + sum_f) / max(s1_total, 1)
     print(f"\ntrue singletons             : {singles:,} "
           f"({singles / max(s1_total, 1):.2%})  <- score 1.0 for an empty prediction")
-    print(f"F_0.5 ceiling with a PERFECT classifier over these candidates: "
-          f"{ceiling:.4f}")
-    print("  (upper bound — assumes every covered entity scores exactly 1.0)")
+    print(f"F_0.5 CEILING over these candidates : {ceiling:.4f}")
+    print("  assumes a classifier that keeps exactly the true matches and")
+    print("  nothing else, so it bounds what any scorer can reach WITHOUT")
+    print("  better blocking. Compare it to the end-to-end F_0.5 to see")
+    print("  whether the next gain is in blocking or in scoring.")
     print("  note: the coverage percentages above are over NON-singleton "
-          f"entities ({per_entity.height:,}), this ceiling is over all "
+          f"entities ({per_entity.height:,}); this ceiling is over all "
           f"{s1_total:,}")
 
 
@@ -230,6 +262,7 @@ def budget_curve(
     _section("macro recall vs per-entity budget (same candidate file)")
     print(f"{'budget':>8} {'macro recall':>14} {'pair recall':>13} "
           f"{'candidates':>13} {'mean/entity':>12}")
+    observed: list[tuple[int, float]] = []
     for k in cuts:
         cut = ranked.filter(pl.col("rank") < k)
         per_entity = (
@@ -252,11 +285,26 @@ def budget_curve(
             (per_entity["n_found"] / per_entity["n_true"]).mean()
         )
         pair = int(per_entity["n_found"].sum()) / int(per_entity["n_true"].sum())
+        observed.append((k, macro))
         print(f"{k:>8} {macro:>13.2%} {pair:>12.2%} {cut.height:>13,} "
               f"{cut.height / max(n_entities, 1):>11.2f}")
-    print("\n  still climbing at the largest cut -> the budget is evicting true")
-    print("  matches and is worth raising. Flat -> the budget is not the")
-    print("  constraint, and raising it only hands the scorer more negatives.")
+
+    # Read the curve rather than printing advice for both cases and leaving the
+    # reader to pick. The first version printed "still climbing -> raise the
+    # budget" unconditionally, directly above a table that had gone flat, which
+    # is documentation contradicting its own measurement.
+    if len(observed) < 2:
+        return
+    (k0, m0), (k1, m1) = observed[-2], observed[-1]
+    gain = m1 - m0
+    if gain < 0.002:
+        print(f"\n  FLAT between {k0} and {k1} (+{gain:.2%}). The budget is NOT the")
+        print("  constraint — raising it adds nothing but negatives for the")
+        print("  scorer to reject. Recall is limited by what the keys reach.")
+    else:
+        print(f"\n  STILL CLIMBING between {k0} and {k1} (+{gain:.2%}). The budget is")
+        print("  evicting true matches; re-run blocking with a larger --budget")
+        print("  (cuts above the budget cannot be read off this file).")
 
 
 def key_diagnostics(

@@ -544,7 +544,8 @@ def generate(
 def generate_multi(
     split: str, data: Path, work: Path, topk: int, threshold: float,
     budget: int, max_bucket: int | None, chunk: int, merge_buckets: int,
-    keys: tuple[str, ...] | None,
+    keys: tuple[str, ...] | None, reuse_candidates: bool = False,
+    acronym_cap: int | None = None, acronym_min_len: int = 0,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Multi-key blocking, then the same address score and top-k as before.
 
@@ -562,9 +563,21 @@ def generate_multi(
     can use them — but that is a separate change and is deliberately not
     bundled into this one, so the blocking gain stays attributable.
     """
-    cand_path = blocking.block_split(
-        split, work, budget, max_bucket, chunk, merge_buckets, keys
-    )
+    cand_path = paths.candidates_parquet(split, work)
+    if reuse_candidates and cand_path.is_file():
+        # Blocking is the expensive step (roughly 3.5 minutes at full scale, an
+        # order more than normalization), and it is deterministic given the
+        # normalized parquet. Reusing it makes threshold and top-k work cheap.
+        # Unlike the normalization cache there is no freshness guard here,
+        # because the candidate file carries no record of the budget, caps or
+        # key set it was built with — so this is opt-in and the caller owns it.
+        print(f"  reusing {cand_path.name} (--reuse-candidates; "
+              "not checked against --budget/--keys/--max-bucket)")
+    else:
+        cand_path = blocking.block_split(
+            split, work, budget, max_bucket, chunk, merge_buckets, keys,
+            acronym_cap, acronym_min_len,
+        )
 
     # Address lookups, resident. Two narrow frames — IDs and one short string —
     # rather than the full normalized set.
@@ -800,6 +813,18 @@ def main() -> None:
                    help="Hash partitions for the candidate merge and the "
                         "scoring pass. Affects peak memory only, not the "
                         "output.")
+    p.add_argument("--reuse-candidates", action="store_true",
+                   help="Skip blocking and score the existing candidate "
+                        "parquet. Blocking is the expensive step (~3.5 min at "
+                        "full scale) and is deterministic given the normalized "
+                        "parquet, so this makes --threshold and --topk work "
+                        "cheap. NOT freshness-checked: the candidate file does "
+                        "not record the budget, caps or keys it was built "
+                        "with, so re-run blocking after changing any of them.")
+    p.add_argument("--acronym-cap", type=int, default=None,
+                   help="Bucket cap for name_acronym alone. See src.blocking.")
+    p.add_argument("--acronym-min-len", type=int, default=0,
+                   help="Drop acronyms shorter than this. See src.blocking.")
     p.add_argument("--force-normalize", action="store_true",
                    help="Rebuild the normalized parquet even if it looks "
                         "current. The cache is invalidated automatically when "
@@ -866,6 +891,7 @@ def main() -> None:
         cands, matches = generate_multi(
             a.split, data, work, a.topk, a.threshold, a.budget,
             a.max_bucket, a.chunk, a.merge_buckets, keys,
+            a.reuse_candidates, a.acronym_cap, a.acronym_min_len,
         )
     else:
         if a.normalize_only:
