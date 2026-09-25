@@ -277,10 +277,12 @@ def main() -> None:
                         "memory, but removes most true partners from reach, so "
                         "the reported F_0.5 understates the pipeline.")
     p.add_argument("--max-bucket", type=int, default=DEFAULT_MAX_BUCKET)
-    p.add_argument("--topk", type=int, default=5,
-                   help="Max predicted matches per entity (true mean is ~3.5).")
-    p.add_argument("--threshold", type=float, default=0.3,
-                   help="Minimum address Jaccard to predict a match.")
+    p.add_argument("--topk", type=int, default=8,
+                   help="Max predicted matches per entity. Flat above 5 on the "
+                        "training set; blocking rarely yields more.")
+    p.add_argument("--threshold", type=float, default=0.15,
+                   help="Minimum address Jaccard to predict a match. Tuned on the "
+                        "full training split; see README for the sweep.")
     p.add_argument("--chunk", type=int, default=250_000)
     a = p.parse_args()
 

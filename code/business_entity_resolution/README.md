@@ -36,9 +36,21 @@ Country is folded into the blocking key rather than compared separately, which c
 
 ## Knobs
 
-`--threshold` is the address Jaccard floor and the most useful dial: F_0.5 weights precision twice as heavily as recall, so raising it often pays. `--topk` caps predictions per entity; the true mean is about 3.5 matches, so 5 is a reasonable start. `--max-bucket` controls how aggressively over-common name keys are discarded. `--chunk` sets how many source-1 entities are processed per pass.
+`--threshold` is the address Jaccard floor and the only dial that moves the score materially. `--topk` caps predictions per entity and is flat above 5, because blocking rarely produces more candidates than that. `--max-bucket` controls how aggressively over-common name keys are discarded; 100 beats both tighter settings tested. `--chunk` sets how many source-1 entities are processed per pass.
 
 `--sample N` matches only the first N Source-1 entities, against the **full** target set, so the reported F_0.5 stays representative — on a quarter of the entities it lands within a few thousandths of the full-run score. `--sample-targets N` additionally truncates Sources 2 and 3 to save memory, and prints a warning, because a Source-1 entity's true partners are scattered anywhere across 10M target rows: keeping only the first N puts most of them out of reach and the score then measures the truncation rather than the pipeline, in either direction.
+
+## Tuned settings
+
+Defaults are `--threshold 0.15 --topk 8 --max-bucket 100`, giving **macro F_0.5 = 0.4670** on the full training split against a do-nothing floor of 0.0558.
+
+The threshold sweep has a clear interior optimum — the address signal is worth keeping, and worth not over-trusting:
+
+| threshold | 0.00 | 0.05 | 0.10 | **0.15** | 0.20 | 0.30 | 0.40 | 0.50 | 0.60 | 0.70 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| macro F_0.5 | 0.3860 | 0.4281 | 0.4496 | **0.4670** | 0.4664 | 0.4455 | 0.4127 | 0.3672 | 0.3056 | 0.2355 |
+
+`--topk` at 3 / 4 / 5 / 6 scores 0.4447 / 0.4454 / 0.4455 / 0.4455 — flat. `--max-bucket` at 20 / 50 / 100 scores 0.4373 / 0.4505 / 0.4670.
 
 ## Memory
 
