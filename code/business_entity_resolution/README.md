@@ -20,6 +20,14 @@ python -m src.main --split train                   # full run, prints macro F_0.
 python -m src.main --split test                    # writes the submission
 ```
 
+To iterate on blocking without paying for normalization every time, split the run. The normalized parquet is cached and reused until the source data, the rules in `text_norm.py`/`blocking.py`, or the row count change:
+
+```bash
+python -m src.main --split train --normalize-only   # once, ~3 min
+python -m src.blocking   --split train --budget 20  # seconds
+python -m src.block_eval --split train              # what that blocking bought
+```
+
 Outputs go to `output/matching_results.tsv` and `output/candidate_pairs.tsv` at the repo root, or wherever `--out-dir` points. **Both splits write to the same directory**, so run `--split test` last (or give it its own `--out-dir`) — a training run afterwards overwrites the submission with training predictions.
 
 Validate before submitting, from the `student_resource/` directory:
@@ -36,13 +44,19 @@ Five stages, each one function with an explicit input and output.
 
 Accent handling deliberately strips only the Latin combining-diacritics block, never `\p{M}`. In Indic scripts the vowel signs and virama are themselves Mark-category characters, so a blanket strip deletes the vowels.
 
-**Block** (`build_targets`) uses a single exact key — country plus the sorted unique tokens of `name_core` — so `Acme Foods` and `Foods Acme` collide regardless of word order. Keys shared by more than `--max-bucket` records are dropped, since a key that common carries almost no evidence. Country is folded into the key rather than compared separately: it agrees on 100% of true training pairs, so it is a free hard partition. It is treated as an opaque label and never enumerated, because the test set contains France and the training set does not.
+**Block** (`blocking.py`) takes the union of five exact keys — `name_sorted`, `name_core`, `name_nospace`, `addr_sorted` and `name_acronym`, each paired with country. No single key is enough: the best one agrees on about 53% of true pairs. But they are nearly free (a hash join, not a similarity search) and they disagree with each other, so the union reaches much further than the best of them. `--blocking single` reproduces the previous one-key configuration.
+
+Each key carries a weight and its own bucket cap, and a candidate's score is the sum of the weights of the keys that found it, **divided by `log2(1 + bucket_size)`**. That inverse-frequency term is what makes the score discriminative: sharing a name with one other record is strong evidence, sharing it with 2000 is nearly none. Without it, tied candidates are evicted by the budget cap in effectively alphabetical order — worth 2.4 points of macro recall at an identical candidate count.
+
+Country is folded into every key rather than compared separately: it agrees on 100% of true training pairs, so it is a free hard partition. It is treated as an opaque label and never enumerated, because the test set contains France and the training set does not.
 
 **Score** (`_jaccard`) is the token-set overlap of `addr_core`. **Predict** (`generate`) keeps pairs at or above `--threshold`, best `--topk` per entity. **Evaluate** (`macro_f05`) reports macro F_0.5 plus macro precision, macro recall, the share of entities given an empty prediction, how many of those have real matches, and mean predicted versus true count.
 
 ## Knobs
 
-`--threshold` is the address Jaccard floor and currently the dial that moves the score most. `--topk` caps predictions per entity. `--max-bucket` controls how aggressively over-common keys are discarded. `--chunk` sets how many source-1 entities are processed per pass.
+`--threshold` is the address Jaccard floor. `--topk` caps predictions per entity. `--budget` caps *candidates* per entity before scoring. `--max-bucket` overrides every key's own cap with one global value — normally leave it unset, since the name keys need a loose cap and `name_acronym` a tight one. `--keys` restricts blocking to a subset, for attributing a change to one key. `--chunk` sets how many source-1 entities are processed per pass; `--merge-buckets` sets the hash partitioning of the merge and scoring passes, which affects peak memory only and not the output.
+
+**`--budget` and `--topk` are not the same kind of number, and sizing the budget from true-match counts is a mistake.** The maximum true match count is 11 and the 99th percentile is 8, which bounds `--topk`. The budget has to be large enough that true matches are not crowded out by *false* candidates that outrank them, which is a question about ranking quality, not about match counts. `src.block_eval` reports macro recall at every cut of a single candidate file, which answers it in one run instead of a sweep.
 
 `--sample N` matches only the first N Source-1 entities, against the **full** target set, so the reported F_0.5 stays representative — on a quarter of the entities it lands within a few thousandths of the full-run score. `--sample-targets N` additionally truncates Sources 2 and 3 to save memory, and prints a warning, because a Source-1 entity's true partners are scattered anywhere across 10M target rows: keeping only the first N puts most of them out of reach and the score then measures the truncation rather than the pipeline, in either direction.
 
@@ -60,6 +74,10 @@ Defaults are `--threshold 0.15 --topk 8 --max-bucket 100`. Macro F_0.5 on the fu
 
 Romanization is off by default: +0.0005 for +126s. Exact-key blocking requires *every* token to agree, and a partly-romanized name still differs on its Latin tokens. Its measured value is character-trigram similarity on cross-script pairs (0.000 → 0.326), which only pays once a fuzzy stage exists — so the code stays.
 
+Multi-key blocking is new and **unmeasured on the real data** — every score in the table above is single-key. Run `src.block_eval` before trusting any weight or cap in `KEY_SPECS`; they were all derived under the superseded normalization, against key definitions that have since changed.
+
+One thing to expect. Until now every candidate was an exact name match, so address Jaccard was *independent* confirming evidence and a low threshold was safe. That is no longer true: candidates reached through `addr_sorted` agree on their address tokens by construction, so scoring them by address overlap is close to circular and they will pass almost any threshold. Precision should be expected to fall and the right threshold to move. `block_score` and `n_keys` are carried through the candidate file so a scorer can use the name evidence too, but that is a separate change and is deliberately not bundled with this one.
+
 ### What is stale
 
 `--threshold 0.15` and `--max-bucket 100` were both tuned against the superseded normalization and are now mis-tuned by an unmeasured amount. `addr_core` expands abbreviations and drops stopwords, so the Jaccard distribution has shifted. The threshold sweep below is retained for reference but **no longer describes the current pipeline**:
@@ -74,12 +92,14 @@ The precision and recall figures printed after each training run indicate which 
 
 Roughly 12.5M rows per split. Sources are read once and normalized in slices; the resident structure is the source-2/3 key table, about 600MB–1GB at full scale, which fits in 16GB alongside one slice.
 
+Five resident key tables would be 3–5GB, so blocking loops key-outer instead: build one target table, join all of source 1 against it, spill the hits to parquet, free it, move on. Peak memory stays at about one key table, which is what the single-key pipeline already used. The merge is then the step that would otherwise die at the very end of the longest job — concatenating every partial and taking a global sort over ~100M rows wants 8–12GB — so it hashes the entity ID into `--merge-buckets` partitions and processes them one at a time. The budget is per entity and entities are independent, so this is exact rather than approximate; bucket count is verified not to change the output.
+
 The reader avoids two tempting APIs on purpose. `scan_csv(...).slice(offset, chunk).collect()` in a loop re-reads the file from the start every time — 42 passes over a 10M-row TSV. `read_csv_batched` is deprecated in current polars, and its replacement `LazyFrame.collect_batches` does not exist in 1.18, is documented as unstable, and warns that it is slower than the alternatives. Reading once and slicing the DataFrame is zero-copy and version-agnostic; outputs are verified identical on polars 1.18.0 and 1.44.2.
 
 ## Working on it
 
 One change at a time, measured against the run it replaces, with the previous behaviour reachable behind a flag rather than deleted. That is what makes a regression attributable instead of something to bisect.
 
-The stage boundaries are where the next changes go. A second blocking key extends `build_targets` — measured per-key diagnostics put `addr_sorted` first, with the highest unique contribution of any key (11.2%, more than every name key combined) despite the weakest agreement (23.5%). A fuzzy candidate stage appends to the candidate set before `generate` filters it, targeting the 21.4% of true pairs that no exact key reaches at any cap. A learned scorer replaces `_jaccard` and the threshold comparison with a model over several pair features; nothing has been trained yet, so no precision figure from a model exists.
+The stage boundaries are where the next changes go. A fuzzy candidate stage appends to the candidate set before scoring, targeting the true pairs that no exact key reaches at any cap — and `--translit` becomes worth turning on at that moment and not before. A learned scorer replaces `_jaccard` and the threshold comparison with a model over several pair features, including `block_score` and `n_keys`; nothing has been trained yet, so no precision figure from a model exists.
 
-`claude/findings.md` in the project holds the measured numbers behind all of the above. The `feat/full-pipeline` branch has working implementations of romanization, five weighted blocking keys with inverse-frequency scoring, FAISS n-gram search and per-key recall diagnostics; its components can be reintroduced here one stage at a time.
+`claude/findings.md` in the project holds the measured numbers behind all of the above. The `feat/full-pipeline` branch still has a FAISS n-gram fuzzy stage that has not been reintroduced here.

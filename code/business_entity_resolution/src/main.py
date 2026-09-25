@@ -62,9 +62,9 @@ from pathlib import Path
 
 import polars as pl
 
-from . import text_norm, translit
+from . import blocking, paths, text_norm, translit
 
-SOURCE_COLUMNS = ["entity_id", "business_name", "business_address", "country"]
+SOURCE_COLUMNS = paths.SOURCE_COLUMNS
 # A key shared by more records than this carries almost no evidence and would
 # emit a very large number of useless pairs, so its bucket is dropped.
 #
@@ -80,15 +80,11 @@ DEFAULT_MAX_BUCKET = 100
 # --------------------------------------------------------------------------
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    return paths.REPO_ROOT
 
 
-def source_path(split: str, source: int, data: Path) -> Path:
-    return data / "dataset" / split / f"{split}_source{source}.tsv"
-
-
-def ground_truth_path(data: Path) -> Path:
-    return data / "dataset" / "train" / "train_ground_truth.tsv"
+source_path = paths.source_tsv
+ground_truth_path = paths.ground_truth_tsv
 
 
 # --------------------------------------------------------------------------
@@ -246,6 +242,200 @@ def load_prepared(
 
 
 # --------------------------------------------------------------------------
+# normalized parquet cache (multi-key blocking reads this)
+# --------------------------------------------------------------------------
+
+# Everything the multi-key blocker and the address scorer need, and nothing
+# else. `text_norm` defines twelve columns between names and addresses;
+# materializing all of them over 10.3M rows costs several GB that is
+# immediately discarded.
+#
+# Derived from KEY_SPECS rather than written out, so adding a key there is the
+# only edit needed. The prefix decides which expression builder supplies it;
+# an unrecognised prefix raises instead of being silently dropped, which would
+# otherwise surface as a missing-column error deep inside blocking.
+_NAME_KEYS = tuple(k for k in blocking.KEY_COLUMNS if k.startswith("name_"))
+# `addr_core` is both a candidate blocking key and the scorer's input. It is
+# deduped rather than selected twice, which polars rejects as a duplicate
+# column, and it is appended so it is present even when no address key blocks.
+_ADDR_KEYS = tuple(
+    dict.fromkeys(
+        [k for k in blocking.KEY_COLUMNS if k.startswith("addr_")] + ["addr_core"]
+    )
+)
+_UNKNOWN = set(blocking.KEY_COLUMNS) - set(_NAME_KEYS) - set(_ADDR_KEYS)
+if _UNKNOWN:
+    raise ImportError(
+        f"blocking keys {sorted(_UNKNOWN)} match neither the name_ nor addr_ "
+        "prefix, so no expression builder supplies them."
+    )
+
+NORMALIZED_COLUMNS: tuple[str, ...] = (
+    "entity_id", "country_norm", *_NAME_KEYS, *_ADDR_KEYS,
+)
+
+
+def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
+    """Raw rows -> every blocking key plus the address used for scoring.
+
+    Unlike `prepare`, no row is dropped here. A record whose name normalizes to
+    nothing is still reachable through `addr_sorted`, and dropping it at this
+    stage would silently remove it from the target universe for every key. Each
+    key filters its own empties when its target table is built.
+    """
+    if use_translit:
+        # Romanize before any cleaning: `text_norm.ACCENT_MAP` folds the IAST
+        # diacritics this emits, so the order matters.
+        df = df.with_columns([
+            translit.romanize_series(df.get_column(c))
+            for c in ("business_name", "business_address")
+        ])
+
+    out = df.select([
+        pl.col("entity_id"),
+        text_norm.country_expression(),
+        *_pick(text_norm.name_expressions(), *_NAME_KEYS),
+        *_pick(text_norm.address_expressions(), *_ADDR_KEYS),
+    ])
+    # Column order is load-bearing: every chunk is appended to the same parquet
+    # writer, and a schema that differs between chunks fails the write. Assert
+    # it here, where the message names the drift, rather than at the writer.
+    assert out.columns == list(NORMALIZED_COLUMNS), (
+        f"normalized columns drifted: {out.columns} != {list(NORMALIZED_COLUMNS)}"
+    )
+    return out
+
+
+def _rule_mtime() -> float:
+    """Newest mtime among the modules that define the normalization rules.
+
+    Comparing the cache against the source TSV alone is not enough, and the gap
+    is the dangerous kind: editing `text_norm` changes every key value while
+    leaving the TSV untouched, so a stale cache would be reused silently and
+    the next blocking measurement would describe the OLD rules while appearing
+    to describe the new ones. Nothing would crash and no number would look
+    obviously wrong.
+    """
+    here = Path(__file__).resolve().parent
+    return max(
+        (p.stat().st_mtime for p in (here / "text_norm.py", here / "translit.py",
+                                     here / "blocking.py", here / "main.py")
+         if p.is_file()),
+        default=0.0,
+    )
+
+
+def _is_fresh(parquet: Path, source: Path, expected_rows: int | None) -> bool:
+    """Whether a cached parquet can be reused.
+
+    Three guards, all earned. The cache must be newer than the source data AND
+    newer than the rules that produced it (see `_rule_mtime`), and it must hold
+    the number of rows this run would write — which catches both an interrupted
+    write and a cache built under a different `--sample`.
+
+    Note what is NOT covered: toggling `--translit` changes the output without
+    touching any file, so it does not invalidate the cache. Pass
+    `--force-normalize` when changing it.
+    """
+    if not parquet.is_file():
+        return False
+    cached = parquet.stat().st_mtime
+    if cached < source.stat().st_mtime or cached < _rule_mtime():
+        return False
+    try:
+        import pyarrow.parquet as pq
+
+        rows = pq.ParquetFile(parquet).metadata.num_rows
+    except Exception:
+        return False
+    return expected_rows is None or rows == expected_rows
+
+
+def ensure_normalized(
+    split: str,
+    data: Path,
+    work: Path,
+    use_translit: bool,
+    chunk: int,
+    force: bool,
+    sample: int | None = None,
+    sample_targets: int | None = None,
+) -> None:
+    """Normalize all three sources to parquet, reusing an up-to-date cache.
+
+    Normalization is the expensive deterministic step — roughly 15 seconds per
+    million rows, so about three minutes per full run. Caching it means
+    iterating on blocking does not pay for it again, which is the whole reason
+    this stage writes to disk rather than staying in memory.
+
+    `sample` truncates source 1 only. Truncating the target sources instead
+    makes any score meaningless — a source-1 entity's true partners are
+    scattered anywhere across 10M target rows, so keeping the first N removes
+    most of them from reach and the run measures the truncation rather than the
+    pipeline. `sample_targets` exists for memory pressure and warns.
+
+    The row count written is compared against the row count that *would* be
+    written, so a cache built under one sample size is correctly rebuilt under
+    another — including a sampled cache being rebuilt for a full run, which is
+    the case that would otherwise silently report a truncated score.
+    """
+    import pyarrow.parquet as pq
+
+    for source in (1, 2, 3):
+        src = source_path(split, source, data)
+        dst = paths.normalized_parquet(split, source, work)
+        limit = sample if source == 1 else sample_targets
+        available = _row_count(src)
+        expected = (
+            None if available is None
+            else (min(limit, available) if limit else available)
+        )
+        if not force and _is_fresh(dst, src, expected):
+            shape = f"{expected:,} rows" if expected is not None else "row count unverified"
+            print(f"  source{source}: reusing {dst.name} ({shape})")
+            continue
+
+        raw = scan_source(split, source, data, limit).collect()
+        writer = None
+        try:
+            for offset in range(0, max(raw.height, 1), chunk):
+                block = raw.slice(offset, chunk)
+                if block.is_empty():
+                    continue
+                table = prepare_full(block, use_translit).to_arrow()
+                if writer is None:
+                    writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
+                writer.write_table(table)
+        finally:
+            if writer is not None:
+                writer.close()
+        print(f"  source{source}: normalized {raw.height:,} rows -> {dst.name}")
+        del raw
+
+
+def _row_count(src: Path) -> int | None:
+    """Row count of a source TSV, for the cache freshness check.
+
+    Counting is a full scan of one column, which is far cheaper than
+    normalizing, but not free — so a failure here (a missing file, say) returns
+    None and simply disables that half of the guard rather than crashing a run
+    that would otherwise work.
+    """
+    try:
+        return int(
+            pl.scan_csv(
+                src, separator="\t", quote_char=None, has_header=True,
+                schema={c: pl.Utf8 for c in SOURCE_COLUMNS},
+            )
+            .select(pl.len())
+            .collect()
+            .item()
+        )
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------
 # pipeline
 # --------------------------------------------------------------------------
 
@@ -275,10 +465,33 @@ def build_targets(
     return targets.rename({"entity_id": "candidate_entity_id", "addr": "cand_addr"})
 
 
+def _tokens(col: pl.Expr) -> pl.Expr:
+    """Unique non-empty tokens.
+
+    Filtering empties is not cosmetic. `"".str.split(" ")` yields `[""]` in
+    polars — a list of length ONE, not zero — so without this filter two empty
+    addresses have an intersection of 1 and a union of 1 and score a Jaccard of
+    **1.0**, the maximum. The `union == 0` guard below never fired, and any
+    candidate pair with two blank addresses was predicted as a match at top
+    rank.
+
+    Latent rather than active on the training split, which is why it survived:
+    source 1 has no empty normalized addresses, so the empty-empty case needs
+    both sides blank and never arises there. It is one address-only record away
+    from firing on the test split, where nothing has been measured.
+    """
+    return (
+        col.fill_null("")
+        .str.split(" ")
+        .list.eval(pl.element().filter(pl.element().str.len_chars() > 0))
+        .list.unique()
+    )
+
+
 def _jaccard(a: pl.Expr, b: pl.Expr) -> pl.Expr:
     """Token-set Jaccard. Both addresses empty counts as no evidence, not a match."""
-    ta = a.str.split(" ").list.unique()
-    tb = b.str.split(" ").list.unique()
+    ta = _tokens(a)
+    tb = _tokens(b)
     inter = ta.list.set_intersection(tb).list.len()
     union = ta.list.set_union(tb).list.len()
     return (
@@ -326,6 +539,94 @@ def generate(
     matches = pl.concat(match_parts, how="vertical") if match_parts else empty
     print(f"\n  candidates: {cands.height:,}   predicted matches: {matches.height:,}")
     return cands, matches
+
+
+def generate_multi(
+    split: str, data: Path, work: Path, topk: int, threshold: float,
+    budget: int, max_bucket: int | None, chunk: int, merge_buckets: int,
+    keys: tuple[str, ...] | None,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Multi-key blocking, then the same address score and top-k as before.
+
+    A caution that the numbers will need to settle. Until now every candidate
+    was an exact name match, so address Jaccard was *independent* confirming
+    evidence and a low threshold was safe. That is no longer true: candidates
+    reached through `addr_sorted` agree on their address tokens by
+    construction, so scoring them by address overlap is close to circular and
+    they will pass almost any threshold. Expect precision to fall and the
+    right threshold to move. Read the precision/recall split that `macro_f05`
+    prints rather than assuming 0.15 still holds.
+
+    The honest fix is a scorer that uses the name evidence too — `block_score`
+    and `n_keys` are carried through the candidate file precisely so a model
+    can use them — but that is a separate change and is deliberately not
+    bundled into this one, so the blocking gain stays attributable.
+    """
+    cand_path = blocking.block_split(
+        split, work, budget, max_bucket, chunk, merge_buckets, keys
+    )
+
+    # Address lookups, resident. Two narrow frames — IDs and one short string —
+    # rather than the full normalized set.
+    def _addr(sources: tuple[int, ...], id_alias: str, addr_alias: str) -> pl.DataFrame:
+        return pl.concat(
+            [
+                pl.scan_parquet(paths.normalized_parquet(split, s, work))
+                .select(
+                    pl.col("entity_id").alias(id_alias),
+                    pl.col("addr_core").fill_null("").alias(addr_alias),
+                )
+                for s in sources
+            ],
+            how="vertical",
+        ).collect()
+
+    s1_addr = _addr((1,), "source1_entity_id", "addr")
+    tgt_addr = _addr((2, 3), "candidate_entity_id", "cand_addr")
+    print(f"  address lookups: {s1_addr.height:,} source-1, {tgt_addr.height:,} target")
+
+    cand_parts, match_parts = [], []
+    # Partitioned by the same entity hash the merge used: the top-k cut is per
+    # entity, so entities are independent and a bucket can be scored in
+    # isolation. This keeps the join output bounded instead of materializing
+    # ~44M scored pairs at once.
+    for b in range(merge_buckets):
+        chunk_df = (
+            pl.scan_parquet(cand_path)
+            .filter((pl.col("source1_entity_id").hash() % merge_buckets) == b)
+            .collect()
+        )
+        if chunk_df.is_empty():
+            continue
+        scored = (
+            chunk_df.join(s1_addr, on="source1_entity_id", how="inner")
+            .join(tgt_addr, on="candidate_entity_id", how="inner")
+            .with_columns(_jaccard(pl.col("addr"), pl.col("cand_addr")).alias("sim"))
+        )
+        cand_parts.append(scored.select("source1_entity_id", "candidate_entity_id"))
+        match_parts.append(
+            scored.filter(pl.col("sim") >= threshold)
+            # Sort on the address score first, then fall back to the blocking
+            # evidence, then the id. Jaccard ties are common on short
+            # addresses, and an unbroken tie here picks survivors by row order.
+            .sort(
+                ["sim", "block_score", "n_keys", "candidate_entity_id"],
+                descending=[True, True, True, False],
+            )
+            .filter(pl.int_range(pl.len()).over("source1_entity_id") < topk)
+            .select("source1_entity_id", "candidate_entity_id")
+        )
+        print(f"  scoring bucket {b + 1}/{merge_buckets}", end="\r")
+
+    empty = pl.DataFrame(
+        schema={"source1_entity_id": pl.Utf8, "candidate_entity_id": pl.Utf8}
+    )
+    cands = pl.concat(cand_parts, how="vertical") if cand_parts else empty
+    matches = pl.concat(match_parts, how="vertical") if match_parts else empty
+    print(f"\n  candidates: {cands.height:,}   predicted matches: {matches.height:,}")
+    return cands.rename({"source1_entity_id": "entity_id"}), matches.rename(
+        {"source1_entity_id": "entity_id"}
+    )
 
 
 def write_submission(
@@ -458,7 +759,13 @@ def main() -> None:
                    help="Also truncate Sources 2 and 3 to N rows each. Reduces "
                         "memory, but removes most true partners from reach, so "
                         "the reported F_0.5 understates the pipeline.")
-    p.add_argument("--max-bucket", type=int, default=DEFAULT_MAX_BUCKET)
+    p.add_argument("--max-bucket", type=int, default=None,
+                   help="Drop keys shared by more than this many target "
+                        f"records. Default under --blocking single is "
+                        f"{DEFAULT_MAX_BUCKET}; under multi it is each key's "
+                        "own cap from KEY_SPECS, which is what you want — the "
+                        "name keys need a loose cap and name_acronym a tight "
+                        "one. Setting it explicitly overrides both.")
     p.add_argument("--topk", type=int, default=8,
                    help="Max predicted matches per entity. Flat above 5 on the "
                         "training set; blocking rarely yields more.")
@@ -471,6 +778,37 @@ def main() -> None:
                         "precision/recall figures printed after each training "
                         "run indicate which direction.")
     p.add_argument("--chunk", type=int, default=250_000)
+    p.add_argument("--work-root", default=None,
+                   help="Where the normalized parquet and candidate files go.")
+    p.add_argument("--blocking", choices=("multi", "single"), default="multi",
+                   help="multi: the union of several weighted exact keys, "
+                        "inverse-frequency scored, capped per entity by "
+                        "--budget. single (the 0.6070 configuration): one "
+                        "exact key on (country, sorted name_core tokens). "
+                        "Kept reachable so a regression can be attributed to "
+                        "this stage rather than bisected.")
+    p.add_argument("--budget", type=int, default=20,
+                   help="Candidates kept per entity by multi-key blocking. The "
+                        "maximum true match count is 11 and the 99th "
+                        "percentile is 8, so this is roughly 2x the worst "
+                        "case. Ignored by --blocking single.")
+    p.add_argument("--keys", default=None,
+                   help="Comma-separated subset of blocking keys, for "
+                        f"attributing a change to one key. Default: all of "
+                        f"{','.join(blocking.KEY_COLUMNS)}")
+    p.add_argument("--merge-buckets", type=int, default=16,
+                   help="Hash partitions for the candidate merge and the "
+                        "scoring pass. Affects peak memory only, not the "
+                        "output.")
+    p.add_argument("--force-normalize", action="store_true",
+                   help="Rebuild the normalized parquet even if it looks "
+                        "current. The cache is invalidated automatically when "
+                        "a source file is newer or the row count differs, but "
+                        "not when only --translit changes.")
+    p.add_argument("--normalize-only", action="store_true",
+                   help="Write the normalized parquet and stop, so "
+                        "`python -m src.blocking` and `python -m src.block_eval` "
+                        "can be iterated without redoing it.")
     p.add_argument("--legacy-norm", action="store_true",
                    help="Reproduce the superseded lowercase-and-strip-punctuation "
                         "normalization (0.4670) bit-for-bit. A measurement "
@@ -487,8 +825,17 @@ def main() -> None:
                         "stage exists. Ignored with --legacy-norm.")
     a = p.parse_args()
 
-    data = Path(a.data_root).expanduser() if a.data_root else repo_root() / "student_resource"
-    out = Path(a.out_dir).expanduser() if a.out_dir else repo_root() / "output"
+    data = paths.data_root(a.data_root)
+    out = paths.output_root(a.out_dir)
+    work = paths.work_root(a.work_root)
+
+    # Multi-key blocking reads the normalized parquet, which the legacy rules
+    # do not produce — they emit one fused block key and nothing else. Rather
+    # than half-supporting the combination, refuse it: `--legacy-norm` exists
+    # to reproduce one specific measured run, and that run was single-key.
+    if a.legacy_norm and a.blocking == "multi":
+        p.error("--legacy-norm reproduces the single-key 0.4670 run; pass "
+                "--blocking single with it.")
 
     started = time.perf_counter()
     if a.legacy_norm:
@@ -497,15 +844,38 @@ def main() -> None:
         mode = "text_norm" + (" + romanization" if a.translit else " (no romanization)")
     print(f"entity resolution [{a.split}]  data={data}")
     print(f"  normalization: {mode}")
+    print(f"  blocking: {a.blocking}"
+          + (f"  budget={a.budget}" if a.blocking == "multi" else ""))
     if a.sample_targets:
         print("  WARNING: --sample-targets truncates the match universe, so the "
               "F_0.5 below understates the pipeline. Use it for memory, not "
               "for measurement.")
-    cands, matches = generate(
-        a.split, data, a.sample, a.sample_targets, a.max_bucket,
-        a.topk, a.threshold, a.chunk,
-        a.legacy_norm, a.translit and not a.legacy_norm,
-    )
+
+    if a.blocking == "multi":
+        print("  normalizing:")
+        ensure_normalized(
+            a.split, data, work, a.translit and not a.legacy_norm, a.chunk,
+            a.force_normalize, a.sample, a.sample_targets,
+        )
+        if a.normalize_only:
+            print(f"  done in {time.perf_counter() - started:.1f}s "
+                  f"(--normalize-only; run `python -m src.blocking "
+                  f"--split {a.split}` next)")
+            return
+        keys = tuple(k.strip() for k in a.keys.split(",")) if a.keys else None
+        cands, matches = generate_multi(
+            a.split, data, work, a.topk, a.threshold, a.budget,
+            a.max_bucket, a.chunk, a.merge_buckets, keys,
+        )
+    else:
+        if a.normalize_only:
+            p.error("--normalize-only applies to --blocking multi only.")
+        cands, matches = generate(
+            a.split, data, a.sample, a.sample_targets,
+            a.max_bucket if a.max_bucket is not None else DEFAULT_MAX_BUCKET,
+            a.topk, a.threshold, a.chunk,
+            a.legacy_norm, a.translit and not a.legacy_norm,
+        )
     write_submission(cands, a.split, data, a.sample,
                      out / "candidate_pairs.tsv", "candidate_entity_ids")
     preds = write_submission(matches, a.split, data, a.sample,
