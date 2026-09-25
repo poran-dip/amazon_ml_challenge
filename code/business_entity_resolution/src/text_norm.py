@@ -62,6 +62,12 @@ LEGAL_ABBREV: dict[str, str] = {
     "mktg": "marketing",
 }
 
+# Web-address debris. `jgsreal.com` survives punctuation folding as the two
+# tokens `jgsreal` and `com`, which is why the backlog showed `com jgsreal`
+# against `jgs real`. Only unambiguous TLDs: `co` is already a legal
+# abbreviation and `in`/`io` collide with ordinary words.
+WEB_TOKENS: tuple[str, ...] = ("www", "com", "net", "org", "edu", "gov", "info", "biz")
+
 # Tokens stripped to form `name_core`. Pure legal-form markers only: words like
 # "group" or "holdings" are NOT here because they distinguish real businesses.
 LEGAL_TOKENS: tuple[str, ...] = (
@@ -274,7 +280,7 @@ def _acronym(col: pl.Expr) -> pl.Expr:
 def name_expressions(col: str = "business_name") -> list[pl.Expr]:
     base = _base_clean(pl.col(col))
     norm = _expand(base, LEGAL_ABBREV)
-    core = _drop_tokens(norm, LEGAL_TOKENS)
+    core = _drop_tokens(norm, LEGAL_TOKENS + WEB_TOKENS)
     # If stripping legal tokens empties the name, fall back to the full form.
     core = pl.when(core.str.len_chars() == 0).then(norm).otherwise(core)
     return [

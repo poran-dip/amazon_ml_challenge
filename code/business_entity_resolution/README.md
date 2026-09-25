@@ -65,7 +65,24 @@ Reports per-source profiles, blocking-key selectivity, and — the number that m
 
 It also reports the match-count distribution per Source-1 entity and the singleton rate. That rate is the F_0.5 score of a submission that predicts nothing for everyone, so it is the floor any pipeline must beat. A per-source script census shows how much of each source arrived in a non-Latin script.
 
-Later stages (blocking, features, training, prediction) land here as they are built.
+### 2. Blocking (candidate generation)
+
+```bash
+python -m src.blocking --split train
+python -m src.block_eval --split train
+```
+
+Stage A is an exact-key union. No single key is enough — the best (`name_sorted`) agrees on only 52.8% of true pairs — but the keys are hash joins rather than similarity searches, and they disagree with each other, so their union recovers substantially more than the best of them alone. Keys used, weighted by how precise EDA showed them to be: `name_sorted`, `name_core`, `name_nospace`, `addr_sorted`, `name_acronym`. A candidate's score is the sum of the weights of the keys it matched on, so a record found by three keys outranks one found by an acronym collision alone.
+
+Country is folded into every key as a hard partition. It agrees on 100% of true pairs, so it costs no recall and removes all cross-country comparisons.
+
+Key values whose source-2/3 bucket exceeds `--max-bucket` (default 100) are dropped before the join. `name_acronym` has a 17,606-record bucket in source 1 alone; joining buckets that large emits hundreds of millions of pairs carrying almost no evidence.
+
+`src/block_eval.py` reports pair recall (the hard ceiling on downstream recall), macro recall (per entity then averaged, which is how F_0.5 is scored), the share of entities whose matches were *all* found — the only ones that can still score 1.0 — and the count of entities left under budget, which is the workload handed to stage B.
+
+Stage B, a fuzzy character-n-gram search over the entities stage A left short, is not built yet.
+
+Later stages (features, training, prediction) land here as they are built.
 
 ## Design notes
 
