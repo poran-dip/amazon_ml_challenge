@@ -95,12 +95,16 @@ def _target_keys(split: str, work: Path, key: str, max_bucket: int) -> pl.DataFr
     ]
     combined = pl.concat(frames, how="vertical").collect()
     sizes = combined.group_by("bk").len()
-    keep = sizes.filter(pl.col("len") <= max_bucket).select("bk")
+    keep = sizes.filter(pl.col("len") <= max_bucket)
     dropped = sizes.height - keep.height
-    kept = combined.join(keep, on="bk", how="inner")
+    # Carry bucket size through: it becomes an inverse-frequency term in the
+    # score, so a match in a bucket of 2 outranks one in a bucket of 2000.
+    kept = combined.join(keep, on="bk", how="inner").rename(
+        {"entity_id": "candidate_entity_id", "len": "bucket_size"}
+    )
     print(f"    {key:<14} target rows {combined.height:>12,} -> {kept.height:>12,} "
           f"({dropped:,} buckets over cap dropped)")
-    return kept.rename({"entity_id": "candidate_entity_id"})
+    return kept
 
 
 def block_split(
@@ -138,7 +142,15 @@ def block_split(
                 hit = left.join(targets[key], on="bk", how="inner").select(
                     pl.col("entity_id").alias("source1_entity_id"),
                     pl.col("candidate_entity_id"),
-                    pl.lit(weight, dtype=pl.Float32).alias("w"),
+                    # Inverse-frequency weighting. Sharing a name with one other
+                    # record is strong evidence; sharing it with 2000 is nearly
+                    # none. Without this the budget cap cannot tell tied
+                    # candidates apart and evicts true matches alphabetically —
+                    # measured at ~758k true pairs lost on the training set.
+                    (
+                        pl.lit(weight, dtype=pl.Float32)
+                        / (pl.col("bucket_size").cast(pl.Float32) + 1.0).log(2.0)
+                    ).alias("w"),
                 )
                 if hit.height:
                     per_key.append(hit)
