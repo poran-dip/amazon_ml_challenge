@@ -20,10 +20,15 @@ Stages:
 * evaluate    on train, macro F_0.5 against the ground truth
 
 Two flags exist so the normalization change is attributable rather than bundled:
-`--legacy-norm` restores the original lowercase-and-strip-punctuation behaviour
-that scored 0.4670, and `--no-translit` keeps the new rules but skips
-romanization. Three runs therefore separate "better rules" from "cross-script
-recovery" instead of reporting one combined delta.
+`--legacy-norm` restores the original lowercase-and-strip-punctuation behaviour,
+and `--translit` adds Indic romanization on top of the new rules. Measured on
+the full training split:
+
+    legacy                  0.4670    27s
+    text_norm               0.6070   176s
+    text_norm + translit    0.6075   302s
+
+Romanization is therefore off by default — see `--translit` for why.
 
 Memory: Source 1 is streamed in chunks; the resident structure is the source-2/3
 key table, roughly 600MB-1GB at full scale. `--sample` runs on a slice for
@@ -377,8 +382,35 @@ def macro_f05(predictions: pl.DataFrame, data: Path, column: str) -> float:
     )
     if df.height == 0:
         return 0.0
-    singles = (df["nt"] == 0).sum()
-    print(f"  scored {df.height:,} entities ({singles:,} singletons)")
+
+    # Diagnostics. F_0.5 alone cannot say which way a threshold should move:
+    # the same score can come from predicting too much or too little. Reporting
+    # macro precision and macro recall separately answers that in one run
+    # instead of a sweep. Precision is averaged over entities that predicted
+    # something and recall over entities that have something to find, since
+    # neither is defined on the other's empty case.
+    n = df.height
+    n_true_single = int((df["nt"] == 0).sum())
+    n_pred_empty = int((df["np"] == 0).sum())
+    # The expensive mistake: a real entity given an empty prediction scores a
+    # flat zero and no threshold change can rescue it without candidates.
+    n_missed = int(((df["np"] == 0) & (df["nt"] > 0)).sum())
+    scored_p = df.filter(pl.col("np") > 0)
+    scored_r = df.filter(pl.col("nt") > 0)
+    prec = float((scored_p["tp"] / scored_p["np"]).mean()) if scored_p.height else 0.0
+    rec = float((scored_r["tp"] / scored_r["nt"]).mean()) if scored_r.height else 0.0
+
+    print(f"  scored {n:,} entities ({n_true_single:,} true singletons, "
+          f"{n_true_single / n:.2%})")
+    print(f"  macro precision {prec:.4f} (over {scored_p.height:,} entities "
+          f"that predicted something)")
+    print(f"  macro recall    {rec:.4f} (over {scored_r.height:,} entities "
+          f"with a true match)")
+    print(f"  predicted empty {n_pred_empty:,} ({n_pred_empty / n:.2%}) — of "
+          f"which {n_missed:,} ({n_missed / n:.2%} of all entities) have real "
+          f"matches and score a flat zero")
+    print(f"  mean predicted {df['np'].mean():.2f} per entity vs "
+          f"{df['nt'].mean():.2f} true")
     return float(df["f"].mean())
 
 
@@ -408,11 +440,15 @@ def main() -> None:
                    help="Restore the original lowercase-and-strip-punctuation "
                         "normalization that scored 0.4670. Use it to re-measure "
                         "the baseline in the same checkout as the new rules.")
-    p.add_argument("--no-translit", dest="translit", action="store_false",
-                   help="Keep the new normalization rules but skip Indic "
-                        "romanization, separating 'better rules' from "
-                        "'cross-script recovery'. Ignored with --legacy-norm, "
-                        "which never romanized.")
+    p.add_argument("--translit", action="store_true",
+                   help="Romanize Indic script before normalizing. OFF by "
+                        "default: measured at +0.0005 macro F_0.5 for +126s on "
+                        "the full training split, because exact-key blocking "
+                        "needs every token to agree and a partly-romanized name "
+                        "still differs on its Latin tokens. Its measured value "
+                        "is character-trigram similarity (0.000 -> 0.326 on "
+                        "cross-script pairs), which only pays once a fuzzy "
+                        "stage exists. Ignored with --legacy-norm.")
     a = p.parse_args()
 
     data = Path(a.data_root).expanduser() if a.data_root else repo_root() / "student_resource"
