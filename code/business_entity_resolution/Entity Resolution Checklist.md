@@ -704,8 +704,14 @@ Source 1 (+ Sources 2/3)
 | V2 | + char 5-gram + prefix | address Jaccard | rules | threshold 0.15 | 0.5765 |
 | V3 | + char 5-gram + prefix | address Jaccard | rules | threshold 0.30 | 0.5935 |
 | V4 | exact multi-key (current norm) | address Jaccard | rules | threshold 0.15 | 0.6070 |
-| **V5** | **exact multi-key, budget 20** | **52 columns** | **LightGBM 5-fold** | **expected F_0.5** | **0.7345 OOF / 0.727 LB** |
-| V6 | + 16 LSH bands | 52 columns | LightGBM 5-fold | expected F_0.5 | **not yet run on real data** |
+| V5 | exact multi-key, budget 20 | 52 columns | LightGBM 5-fold | expected F_0.5 | 0.7345 OOF / 0.727 LB |
+| **V6** | **+ 16 LSH bands, budget 60** | **52 columns** | **LightGBM 5-fold, 2000 rounds** | **expected F_0.5** | **0.8121 OOF** |
+
+V6 measured 26 Sept 2026: 124,383,469 candidates (56.36/entity), blocking macro
+recall 76.09%, ceiling 0.8794, 1 h 45 m end to end, peak 12.74 GB of 15.7 GB.
+Early stopping fired for the first time in the project (best iterations 1282 /
+1513 / 1574 / 1334 / 1332), so every previous run at `--rounds 600` had been
+truncating — though the curve past 600 is nearly flat.
 
 V2 is a *negative* result kept deliberately: the extra keys cost 0.0016 at the
 same threshold. So is `--acronym-min-len 4 --acronym-cap 500`, which measured
@@ -1003,9 +1009,37 @@ detailed and is the best source to fill it from.
 
 ## The three things actually in the way
 
-1. **Blocking recall: 64%, need ~95%.** Nothing else can buy the target. The
-   bands are written and untested on real data.
-2. **The selection rule under-predicts** — 173,911 entities get nothing despite
-   having real matches. `--coverage` is not the cause; that is closed.
-3. **The model path is not reproducible**, so the release check as written
-   cannot pass.
+*Rewritten 26 Sept 2026 from the first fully measured run. All three items below
+replaced earlier versions that were wrong about the cause.*
+
+1. **Recall is 76.23% and cannot exceed 89.15% with the current keys.** The bands
+   landed and delivered +12.19 points of macro recall (63.90% → 76.09%), lifting
+   the ceiling 0.8232 → 0.8794 and the achieved score 0.7345 → **0.8121**. But the
+   union of all 21 keys is 82.62% capped and 89.15% uncapped, and **10.85% of true
+   pairs are unreachable by any key at any cap**. The budget withholds 6.39% and
+   the caps 6.53%. **The 95% target needs a new retrieval mechanism, not a
+   parameter sweep** — and both available parameters enlarge `candidate_pairs.tsv`,
+   which is scored.
+2. **The model converts 92.4% of whatever ceiling blocking hands it** — 92.47%
+   then, 92.35% now, a spread of 0.0012. So *perfect* blocking yields only 0.9241,
+   and the model must improve in parallel with blocking rather than afterwards.
+   The biggest identified gap: address features carry ~74% of total gain through
+   **token-level overlap only**, with no address trigram similarity in the feature
+   table at all, and training sees just 106,448 of 2,206,744 entities because
+   `--train-rows` is denominated in rows and rows/entity went 10.9 → 56.4.
+3. **The model path is still not reproducible**, so the Phase 5 release check as
+   written cannot pass. Unchanged, and still undecided.
+
+**Corrected from the previous version of this list:** the empty-prediction
+problem is a *blocking* failure, not a selection-rule failure. 137,007 of the
+144,226 entities that predict empty despite having real matches have **no true
+candidate at all** — ~95% of them. Only ~7,000 are rule failures. The earlier
+claim that 173,911 entities were being lost to `select_matches` conflated the two
+causes.
+
+**What 0.99 would require**, since it has been named as the top-50 threshold:
+~99% pair recall *and* ~99.5% model conversion, simultaneously. Equivalently,
+"entities with all matches found" must rise from 51.64% to ~99%. It is not
+reachable by this architecture on this timeline, and plans should not assume
+recall work will deliver it. ~0.88 is the realistic near-term target — still a
+large move from 0.727.

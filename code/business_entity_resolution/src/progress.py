@@ -355,14 +355,26 @@ class _Reporter:
         except Exception:  # noqa: BLE001
             self.isatty = False
         self._line_open = False
+        # Length of the transient line currently on screen, so the next one can
+        # be padded to cover exactly what it has to erase.
+        self._last_len = 0
 
     # -- console plumbing ---------------------------------------------------
 
     def width(self) -> int:
+        """Usable columns for a line that must NOT wrap.
+
+        Two columns short of the terminal, not one. A line of exactly
+        `columns` characters wraps in PowerShell -- the cursor moves to the next
+        row and the following `\\r` then returns to the start of the WRONG row,
+        which leaves the tail of every long line stranded on screen. Observed on
+        the first real run: the normalization ticker left fragments like
+        "source1 normalize: 1,750,000/2,20" behind every rewrite.
+        """
         if not self.isatty:
             return 10_000
         try:
-            return max(40, shutil.get_terminal_size((100, 24)).columns - 1)
+            return max(40, shutil.get_terminal_size((100, 24)).columns - 2)
         except Exception:  # noqa: BLE001
             return 100
 
@@ -370,10 +382,13 @@ class _Reporter:
         """Emit one console line, optionally overwritten by the next one.
 
         A transient line on a terminal is rewritten in place with `\\r`; off a
-        terminal it is a normal line, because `\\r` in a log file is noise. The
-        pad-to-width is what stops a short line from leaving the tail of a
-        longer previous one behind it, which is how in-place progress output
-        usually ends up unreadable.
+        terminal it is a normal line, because `\\r` in a log file is noise.
+
+        A shorter line has to erase the longer one under it, and the erasing is
+        done by padding to the PREVIOUS line's length, never to the full
+        terminal width. Padding to the width puts the cursor on the last column
+        of every single rewrite, which is one character from a wrap, and a wrap
+        is what breaks `\\r`.
         """
         if not self.console:
             return
@@ -386,12 +401,15 @@ class _Reporter:
                     # UnicodeEncodeError raised from inside telemetry would kill
                     # a two-hour run over a progress line.
                     text = (text[: w - 3] + "...") if w > 3 else text[:w]
-                self.stream.write("\r" + text.ljust(w))
+                pad = max(self._last_len - len(text), 0)
+                self.stream.write("\r" + text + " " * pad)
+                self._last_len = len(text)
                 self._line_open = True
             else:
                 if self._line_open:
                     self.stream.write("\n")
                     self._line_open = False
+                    self._last_len = 0
                 self.stream.write(text + "\n")
             self.stream.flush()
         except Exception:  # noqa: BLE001
@@ -405,6 +423,7 @@ class _Reporter:
             except Exception:  # noqa: BLE001
                 pass
             self._line_open = False
+            self._last_len = 0
 
     # -- jsonl --------------------------------------------------------------
 

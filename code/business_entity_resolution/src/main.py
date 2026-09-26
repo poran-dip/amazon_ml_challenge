@@ -917,7 +917,8 @@ def generate_model(
     band_min_hits: int, band_cap: int | None, max_pairs: int | None,
     max_total: int | None, coverage: float, folds: int, train_entities: int | None,
     rounds: int, seed: int, train_rows: int | None = None,
-) -> tuple[pl.DataFrame, pl.DataFrame]:
+    max_folds: int | None = None,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame | None]:
     """Multi-key blocking, then features, then the learned scorer.
 
     The same blocking stage as `generate_multi` — only the scoring half
@@ -957,11 +958,13 @@ def generate_model(
         if feat_path.is_file():
             st.set(parquet_gb=round(feat_path.stat().st_size / 1_073_741_824, 3))
     print("  model:")
-    with progress.stage("model", folds=folds, rounds=rounds) as st:
-        matches = model_stage.run(
+    with progress.stage("model", folds=folds, rounds=rounds,
+                        max_folds=max_folds or folds) as st:
+        matches, scored_entities = model_stage.run(
             split, work, topk, coverage, folds, train_entities, rounds, seed,
-            train_rows,
-        ).rename({"source1_entity_id": "entity_id"})
+            train_rows, max_folds,
+        )
+        matches = matches.rename({"source1_entity_id": "entity_id"})
         st.set(rows=matches.height)
 
     # The candidate file is the deliverable for `candidate_pairs.tsv`, which is
@@ -976,7 +979,7 @@ def generate_model(
         .collect()
     )
     print(f"  candidates: {cands.height:,}   predicted matches: {matches.height:,}")
-    return cands, matches
+    return cands, matches, scored_entities
 
 
 def write_submission(
@@ -1019,11 +1022,22 @@ def write_submission(
 # scoring
 # --------------------------------------------------------------------------
 
-def macro_f05(predictions: pl.DataFrame, data: Path, column: str) -> float:
+def macro_f05(
+    predictions: pl.DataFrame, data: Path, column: str,
+    restrict_to: pl.DataFrame | None = None,
+) -> float:
     """Macro-averaged F_0.5 against the training ground truth.
 
     Averaged over ALL source-1 entities, singletons included: an entity with no
     true matches scores 1.0 when the prediction is empty and 0.0 otherwise.
+
+    `restrict_to` limits the average to a given set of source-1 entity IDs, and
+    exists for `--max-folds`. A partial-fold run only produces predictions for
+    the folds it scored; every other entity is absent from the prediction set and
+    `write_submission` gives it an empty list, which is indistinguishable here
+    from a confident empty prediction. Averaging over all of them would report
+    roughly the singleton rate and call it a score — a 0.81 run would print 0.2.
+    Pass the scored entities and the number means what it says.
     """
     # The truth column is renamed BEFORE the join. Both frames call it
     # `matched_entity_ids`, so joining as-is suffixes the right-hand one and
@@ -1035,6 +1049,19 @@ def macro_f05(predictions: pl.DataFrame, data: Path, column: str) -> float:
     ).rename({"matched_entity_ids": "_truth_ids"})
     if column == "_truth_ids":
         raise ValueError("prediction column name collides with the truth column")
+    if restrict_to is not None:
+        keep = restrict_to.rename(
+            {restrict_to.columns[0]: "source1_entity_id"}
+        ).select("source1_entity_id").unique()
+        before = predictions.height
+        predictions = predictions.join(keep, on="source1_entity_id", how="semi")
+        print(f"  restricted to {predictions.height:,} scored entities "
+              f"of {before:,} (--max-folds)")
+        if predictions.is_empty():
+            raise RuntimeError(
+                "restrict_to matched no predictions — the scored-entity set and "
+                "the submission frame do not share an ID space."
+            )
     df = (
         predictions.join(truth, on="source1_entity_id", how="inner")
         .with_columns(
@@ -1229,6 +1256,14 @@ def main() -> None:
                         "it went from 10.9 to 56.4 when the LSH bands landed, "
                         "so a default in entities does not survive a change to "
                         "the candidate set. 0 disables. See src.model.")
+    p.add_argument("--max-folds", type=int, default=None,
+                   help="Train only the first N of --folds folds. "
+                        "`--folds 5 --max-folds 1` is an 80:20 grouped split and "
+                        "saves ONE booster: training drops from 1h15m to ~16m and "
+                        "the test-split ensemble from 2h09m to ~27m (measured). "
+                        "A partial run's submission files are NOT valid — most "
+                        "entities get no prediction — so it is a development "
+                        "mode. Omit it for a submission.")
     p.add_argument("--rounds", type=int, default=600,
                    help="--scorer model only. Boosting round ceiling; early "
                         "stopping on an inner slice usually stops first.")
@@ -1353,6 +1388,11 @@ def main() -> None:
               "F_0.5 below understates the pipeline. Use it for memory, not "
               "for measurement.")
 
+    # Bound before the branch, because every path below reaches the self-score
+    # and only `--max-folds` on the model path ever sets it. Inside the `multi`
+    # branch it would leave `--blocking single` to die on a NameError after the
+    # entire pipeline had already run.
+    scored_entities: pl.DataFrame | None = None
     if a.blocking == "multi":
         print("  normalizing:")
         with progress.stage("normalize", chunk=a.chunk,
@@ -1369,14 +1409,14 @@ def main() -> None:
             return
         keys = tuple(k.strip() for k in a.keys.split(",")) if a.keys else None
         if a.scorer == "model":
-            cands, matches = generate_model(
+            cands, matches, scored_entities = generate_model(
                 a.split, data, work, a.topk, a.budget, a.max_bucket, a.chunk,
                 a.merge_buckets, keys, a.reuse_candidates, a.acronym_cap,
                 a.acronym_min_len, a.bands if keys is None else None,
                 a.band_min_hits, a.band_cap, a.max_pairs_per_key or None,
                 a.max_pairs_total or None, a.coverage, a.folds,
                 a.train_entities or None, a.rounds, a.seed,
-                a.train_rows or None,
+                a.train_rows or None, a.max_folds,
             )
         else:
             cands, matches = generate_multi(
@@ -1411,9 +1451,15 @@ def main() -> None:
 
     if a.split == "train":
         with progress.stage("self-score") as st:
-            score = macro_f05(preds, data, "matched_entity_ids")
-            st.set(macro_f05=round(score, 6))
-        print(f"\n  MACRO F_0.5 = {score:.4f}")
+            score = macro_f05(preds, data, "matched_entity_ids",
+                              restrict_to=scored_entities)
+            st.set(macro_f05=round(score, 6),
+                   partial=scored_entities is not None)
+        label = "HOLDOUT MACRO F_0.5" if scored_entities is not None else "MACRO F_0.5"
+        print(f"\n  {label} = {score:.4f}")
+        if scored_entities is not None:
+            print(f"  over {scored_entities.height:,} held-out entities only; "
+                  "the TSVs just written are NOT a valid submission")
     print(f"  done in {time.perf_counter() - started:.1f}s")
     # Explicit as well as atexit-registered, so the closing telemetry line lands
     # before the shell prompt rather than after it.

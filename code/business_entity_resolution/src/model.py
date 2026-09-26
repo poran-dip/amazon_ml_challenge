@@ -331,11 +331,32 @@ def train_cv(
     seed: int,
     params: dict | None = None,
     train_rows: int | None = None,
-) -> tuple[list, pl.DataFrame]:
-    """Grouped k-fold over source-1 entities. Returns (boosters, OOF scores).
+    max_folds: int | None = None,
+) -> tuple[list, pl.DataFrame, pl.DataFrame | None]:
+    """Grouped k-fold over source-1 entities.
 
-    Every entity appears exactly once in the returned frame, scored by the one
-    fold model that did not train on it.
+    Returns (boosters, scores, scored_entities). `scored_entities` is None when
+    every fold ran — the usual case, where the scores are a complete OOF set —
+    and is the held-out entity list when `max_folds` stopped early, because then
+    the caller MUST restrict its scoring to those entities.
+
+    `max_folds` trains only the first N folds. `--folds 5 --max-folds 1` is
+    exactly an 80:20 grouped split: fold 0 is the 20% holdout, folds 1-4 are the
+    training pool, and the inner early-stopping split is unchanged. It exists
+    because 5-fold costs 5x at BOTH ends — five trainings, and then a five-model
+    ensemble that scores every test row with every booster — for a measured
+    return that does not justify it:
+
+    * per-fold AP on the first full run was 0.9847 / 0.9849 / 0.9845 / 0.9844 /
+      0.9846, a spread of 0.0005. The folds are interchangeable.
+    * macro F_0.5 is a mean over entities. One fold's holdout is ~441k entities,
+      which pins that mean to about +/-0.0006, against decisions that turn on
+      0.01 to 0.08.
+    * measured: 1h15m for 5-fold training and 2h09m for the 5-booster ensemble on
+      the test split. `--max-folds 1` makes those ~16m and ~27m.
+
+    Every fold appears exactly once in the returned scores either way, scored by
+    a model that did not train on it.
 
     Rows are read from the parquet per fold rather than sliced from a resident
     table. The full feature set is ~23.6M rows over 30 float columns plus two
@@ -352,6 +373,27 @@ def train_cv(
         raise RuntimeError(
             f"{n_ents} entities cannot be split into {n_folds} folds."
         )
+    # Clamped rather than validated: `--max-folds 9 --folds 5` means "all of
+    # them", which is what a reader expects, and refusing it would be pedantry.
+    # It must be at least 1, because zero folds trains no model and the failure
+    # would surface much later as an empty booster list.
+    if max_folds is not None and max_folds < 1:
+        raise ValueError(f"--max-folds must be >= 1, got {max_folds}")
+    run_folds = n_folds if max_folds is None else min(max_folds, n_folds)
+    partial = run_folds < n_folds
+    if partial:
+        print(f"\n  {'=' * 66}")
+        print(f"  DEVELOPMENT RUN: training {run_folds} of {n_folds} folds "
+              f"(--max-folds {max_folds}).")
+        print(f"  Only the {run_folds} held-out fold(s) get predictions, so the")
+        print( "  submission files this writes are NOT VALID — most entities")
+        print( "  will have an empty prediction because no model scored them.")
+        print( "  The reported score is restricted to the scored entities and is")
+        print(f"  comparable to a full run; the TSVs are not. Use --max-folds")
+        print(f"  {n_folds} (or omit it) for a submission.")
+        print(f"  {'=' * 66}\n")
+        progress.note("development run: partial folds",
+                      folds_run=run_folds, folds_total=n_folds)
     sizes = plan.group_by("_fold").agg(pl.len().alias("entities")).sort("_fold")
     print(f"  {n_ents:,} entities across {n_folds} folds: "
           + ", ".join(f"{r['entities']:,}" for r in sizes.iter_rows(named=True)))
@@ -390,8 +432,8 @@ def train_cv(
                   train_entities=train_entities or 0)
 
     boosters, oof_parts = [], []
-    fold_tick = progress.ticker(n_folds, unit="folds", label="cv")
-    for f in range(n_folds):
+    fold_tick = progress.ticker(run_folds, unit="folds", label="cv")
+    for f in range(run_folds):
         with progress.stage(f"fold{f}") as fold_st:
             t0 = time.perf_counter()
             rest = plan.filter(pl.col("_fold") != f)
@@ -477,7 +519,15 @@ def train_cv(
     with progress.stage("concat-oof") as st:
         oof = pl.concat(oof_parts, how="vertical")
         st.set(rows=oof.height)
-    return boosters, oof
+    # The held-out entity list, ONLY when folds were skipped. Taken from the
+    # plan rather than from `oof`, because an entity whose candidates all scored
+    # low is still SCORED -- it just ends up with no prediction downstream -- and
+    # deriving the set from the predictions would silently drop exactly the
+    # entities the diagnostics care about most.
+    scored_entities = (
+        plan.filter(pl.col("_fold") < run_folds).select(ENT) if partial else None
+    )
+    return boosters, oof, scored_entities
 
 
 def predict_subset(
@@ -542,6 +592,15 @@ def predict_ensemble(
     rule downstream reads them as probabilities and multiplies `1 - p` across
     an entity's candidates, which is only meaningful on the probability scale.
 
+    COST, measured and not what this docstring used to claim. It said the
+    ensemble costs "prediction, which is minutes". It does not: every booster
+    scores every row, so the cost is (rows x boosters), and the first real test
+    run took **2h09m** for 97.6M rows against five boosters of ~1,400 trees --
+    3.9x the prediction work of the entire five-fold training run, which only
+    ever scored each fold's own fifth with one booster. Throughput is ~61.5k
+    rows/s per booster. `--max-folds 1` saves one booster and makes this ~27m.
+    The old estimate was written when the feature table was 23.6M rows.
+
     Streamed with `pyarrow.ParquetFile.iter_batches`, which is a genuine
     sequential cursor. `pl.scan_parquet(src).slice(offset, chunk).collect()` in
     a loop is NOT — each collect re-reads from the start and discards
@@ -594,7 +653,22 @@ def predict_ensemble(
 # --------------------------------------------------------------------------
 
 def save_models(boosters: list, work: Path, params: dict) -> None:
+    """Write the boosters and their manifest, clearing any previous set first.
+
+    The delete is not tidiness. `load_models` globs `fold*.txt`, so a run that
+    saves ONE booster into a directory holding five from an earlier run leaves
+    four stale files behind and the next test run silently averages them in --
+    models trained on a different feature table, a different candidate set, or
+    both. Same failure family as the stale blocking partials the journal records
+    twice, on a third artefact, and this one would move a leaderboard score
+    without raising anything.
+    """
     d = paths.model_dir(work)
+    stale = sorted(d.glob("fold*.txt"))
+    for f in stale:
+        f.unlink()
+    if stale:
+        print(f"  removed {len(stale)} booster(s) from a previous run")
     for i, b in enumerate(boosters):
         b.save_model(str(d / f"fold{i}.txt"), num_iteration=b.best_iteration)
     (d / "manifest.json").write_text(
@@ -619,7 +693,8 @@ def load_models(work: Path) -> list:
         raise FileNotFoundError(
             f"{manifest} missing — run `python -m src.model --split train` first."
         )
-    saved = json.loads(manifest.read_text())["features"]
+    meta = json.loads(manifest.read_text())
+    saved = meta["features"]
     # Positional, not by name: LightGBM will happily score a matrix whose
     # columns mean something different from the ones it was trained on. Compare
     # the whole ordered list, not the set.
@@ -632,6 +707,19 @@ def load_models(work: Path) -> list:
     files = sorted(d.glob("fold*.txt"))
     if not files:
         raise FileNotFoundError(f"no fold*.txt boosters in {d}")
+    # The manifest records how many boosters the training run saved. A mismatch
+    # means files were added or removed behind this function's back, and since
+    # prediction averages whatever it finds, the wrong count is a silently wrong
+    # submission rather than an error.
+    expected = meta.get("n_folds")
+    if expected is not None and len(files) != expected:
+        raise RuntimeError(
+            f"{d} holds {len(files)} booster(s) but its manifest says "
+            f"{expected}. Prediction averages every fold*.txt it finds, so this "
+            "would score the test split with a model set no training run "
+            "produced. Re-run `python -m src.model --split train`, or delete the "
+            "extras if you removed some deliberately."
+        )
     return [lgb.Booster(model_file=str(f)) for f in files]
 
 
@@ -665,8 +753,15 @@ def run(
     rounds: int,
     seed: int,
     train_rows: int | None = None,
-) -> pl.DataFrame:
-    """Train (train split) or load (test split), then predict and select."""
+    max_folds: int | None = None,
+) -> tuple[pl.DataFrame, pl.DataFrame | None]:
+    """Train (train split) or load (test split), then predict and select.
+
+    Returns (matches, scored_entities). `scored_entities` is None for a complete
+    run and the held-out entity list when `--max-folds` skipped folds, in which
+    case the caller must pass it to `macro_f05` as `restrict_to` and must not
+    treat the submission files as valid.
+    """
     src = paths.features_parquet(split, work)
     if not src.is_file():
         raise FileNotFoundError(
@@ -688,16 +783,31 @@ def run(
                 f"{src} has no `label` column. Rebuild it with "
                 "`python -m src.features --split train`."
             )
-        with progress.stage("train-cv", folds=n_folds, rounds=rounds) as st:
-            boosters, scored = train_cv(
-                src, n_folds, train_entities, rounds, seed, train_rows=train_rows
+        with progress.stage("train-cv", folds=n_folds, rounds=rounds,
+                            max_folds=max_folds or n_folds) as st:
+            boosters, scored, scored_entities = train_cv(
+                src, n_folds, train_entities, rounds, seed,
+                train_rows=train_rows, max_folds=max_folds,
             )
-            st.set(rows=scored.height)
+            st.set(rows=scored.height, boosters=len(boosters))
         save_models(boosters, work, DEFAULT_PARAMS)
         report_importance(boosters)
     else:
+        scored_entities = None
         boosters = load_models(work)
         print(f"  loaded {len(boosters)} boosters")
+        # Said BEFORE the two hours, not after. Every booster scores every row,
+        # so the cost is linear in the ensemble size and the first full test run
+        # measured 2h09m for five at 97.6M rows. The docstring this replaces
+        # called it "minutes".
+        n_pred_rows = pl.scan_parquet(src).select(pl.len()).collect().item()
+        est_s = n_pred_rows * len(boosters) / 61_500.0
+        print(f"  ensemble prediction: {n_pred_rows:,} rows x {len(boosters)} "
+              f"booster(s) — expect roughly "
+              f"{int(est_s // 3600)}h{int(est_s % 3600 // 60):02d}m "
+              f"at the measured 61.5k rows/s per booster")
+        progress.note("ensemble prediction planned", rows=n_pred_rows,
+                      boosters=len(boosters), est_seconds=round(est_s))
         with progress.stage("predict-ensemble", boosters=len(boosters)) as st:
             scored = predict_ensemble(boosters, src)
             st.set(rows=scored.height)
@@ -706,7 +816,7 @@ def run(
                         coverage=coverage) as st:
         picked = select_matches(scored, topk, coverage)
         st.set(rows=picked.height)
-    return picked
+    return picked, scored_entities
 
 
 def main() -> None:
@@ -748,6 +858,16 @@ def main() -> None:
                    help="Boosting round ceiling. Early stopping on an inner "
                         "slice of the training folds usually stops first.")
     p.add_argument("--seed", type=int, default=13)
+    p.add_argument("--max-folds", type=int, default=None,
+                   help="Train only the first N of --folds folds. "
+                        "`--folds 5 --max-folds 1` is an 80:20 grouped split "
+                        "and saves ONE booster, which makes training ~16m "
+                        "instead of 1h15m and the test-split ensemble ~27m "
+                        "instead of 2h09m (measured). Per-fold AP spread on the "
+                        "first full run was 0.0005, and one fold's holdout is "
+                        "~441k entities, so the estimate is worth about "
+                        "+/-0.0006 either way. The submission files a partial "
+                        "run writes are NOT valid — it is a development mode.")
     progress.add_arguments(p)
     a = p.parse_args()
 
@@ -764,9 +884,10 @@ def main() -> None:
     # the two could not be compared in `timings.jsonl`.
     with progress.stage("model", split=a.split, folds=a.folds,
                         rounds=a.rounds) as st:
-        pairs = run(
+        pairs, scored_entities = run(
             a.split, work, a.topk, a.coverage, a.folds,
             a.train_entities or None, a.rounds, a.seed, a.train_rows or None,
+            a.max_folds,
         )
         st.set(rows=pairs.height)
 
@@ -781,9 +902,14 @@ def main() -> None:
         out / "matching_results.tsv", "matched_entity_ids",
     )
     if a.split == "train":
-        score = pipeline.macro_f05(preds, data, "matched_entity_ids")
-        print(f"\n  OUT-OF-FOLD MACRO F_0.5 = {score:.4f}")
+        score = pipeline.macro_f05(preds, data, "matched_entity_ids",
+                                   restrict_to=scored_entities)
+        label = ("HOLDOUT" if scored_entities is not None else "OUT-OF-FOLD")
+        print(f"\n  {label} MACRO F_0.5 = {score:.4f}")
         print("  (every entity scored by a model that did not train on it)")
+        if scored_entities is not None:
+            print(f"  over {scored_entities.height:,} held-out entities only; "
+                  f"{out / 'matching_results.tsv'} is NOT a valid submission")
     print(f"  done in {time.perf_counter() - started:.1f}s")
     progress.shutdown()
 
