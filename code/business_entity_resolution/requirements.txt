@@ -8,3 +8,11 @@ lightgbm>=4.0,<5
 # Used directly by src.model for the feature matrix and the fold ensemble
 # average. polars does not require it, so it is declared rather than assumed.
 numpy>=1.24,<3
+# Run telemetry (src.progress): resident and peak memory, free system memory,
+# and bytes written to disk, per pipeline stage. A full run is ~2 hours on a
+# 16GB machine and the two failure modes that have actually cost runs are
+# running out of memory and running out of time, neither of which was
+# observable before. Windows wheels, no build step, and `src.progress` degrades
+# to timings-only if the import fails, so it is a hard requirement of the
+# measurement and a soft one of the pipeline.
+psutil>=5.9,<8

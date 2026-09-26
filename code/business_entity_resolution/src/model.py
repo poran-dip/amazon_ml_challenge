@@ -60,7 +60,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from . import paths
+from . import paths, progress
 from .features import FEATURE_COLUMNS
 
 # Fold assignment is a hash of the entity ID rather than a stored map or a
@@ -95,6 +95,12 @@ DEFAULT_PARAMS: dict = {
 
 ENT = "source1_entity_id"
 CAND = "candidate_entity_id"
+
+
+# How often LightGBM prints its validation metric under --progress. 600 rounds
+# at every 50 is twelve lines per fold, which is enough to see the shape of the
+# curve and few enough not to bury the stage lines around it.
+_LGB_LOG_EVERY = 50
 
 
 def fold_of(col: str, n_folds: int, seed: int = FOLD_SEED) -> pl.Expr:
@@ -379,59 +385,99 @@ def train_cv(
             .collect()
         )
 
+    progress.note("training plan", entities=n_ents, pair_rows=n_pair_rows,
+                  rows_per_entity=round(per_entity, 2),
+                  train_entities=train_entities or 0)
+
     boosters, oof_parts = [], []
+    fold_tick = progress.ticker(n_folds, unit="folds", label="cv")
     for f in range(n_folds):
-        t0 = time.perf_counter()
-        rest = plan.filter(pl.col("_fold") != f)
-        fit_ents = rest.filter(pl.col("_inner") != 0)
-        early_ents = rest.filter(pl.col("_inner") == 0)
-        if early_ents.is_empty() or fit_ents.is_empty():
-            raise RuntimeError(
-                f"fold {f}: inner split produced {fit_ents.height} training and "
-                f"{early_ents.height} early-stopping entities. With independent "
-                "hash seeds this should not happen — check FOLD_SEED/INNER_SEED."
+        with progress.stage(f"fold{f}") as fold_st:
+            t0 = time.perf_counter()
+            rest = plan.filter(pl.col("_fold") != f)
+            fit_ents = rest.filter(pl.col("_inner") != 0)
+            early_ents = rest.filter(pl.col("_inner") == 0)
+            if early_ents.is_empty() or fit_ents.is_empty():
+                raise RuntimeError(
+                    f"fold {f}: inner split produced {fit_ents.height} training and "
+                    f"{early_ents.height} early-stopping entities. With independent "
+                    "hash seeds this should not happen — check FOLD_SEED/INNER_SEED."
+                )
+            if train_entities:
+                fit_ents = fit_ents.sort("_pick").head(train_entities)
+            # The early-stopping slice is 1/20 of the training folds and was also
+            # unbounded — 88k entities, 5M rows, another ~2.2GB. It only has to be
+            # large enough to detect overfitting, so it gets a quarter of the
+            # training budget.
+            if train_entities:
+                early_ents = early_ents.sort("_pick").head(max(train_entities // 4, 1))
+
+            # Four separately expensive steps, timed separately. "180s per fold"
+            # cannot be acted on; "12s loading, 41s building the Dataset, 96s
+            # training, 31s predicting" can, and the row-loading and Dataset
+            # steps are also where the fold's memory peak lives.
+            with progress.stage("load-rows") as st:
+                fit = rows_for(fit_ents)
+                early = rows_for(early_ents)
+                st.set(rows=fit.height + early.height,
+                       fit_mb=round(fit.estimated_size("mb"), 1),
+                       early_mb=round(early.estimated_size("mb"), 1))
+            with progress.stage("lgb-dataset") as st:
+                dtrain = lgb.Dataset(_matrix(fit), label=fit["label"].to_numpy())
+                dvalid = lgb.Dataset(
+                    _matrix(early), label=early["label"].to_numpy(), reference=dtrain
+                )
+                st.set(rows=fit.height)
+            with progress.stage("lgb-train", rounds=rounds) as st:
+                booster = lgb.train(
+                    params,
+                    dtrain,
+                    num_boost_round=rounds,
+                    valid_sets=[dvalid],
+                    valid_names=["early"],
+                    callbacks=[
+                        lgb.early_stopping(50, verbose=False),
+                        # Under --progress, let LightGBM report the validation
+                        # metric periodically. Early stopping has never fired at
+                        # 600 rounds on any fold, and with no per-iteration
+                        # output there is no way to see whether the curve is
+                        # still improving or flat -- which is the measurement
+                        # that decides whether --rounds 2000 is worth the time.
+                        lgb.log_evaluation(
+                            _LGB_LOG_EVERY if progress.console_enabled() else 0
+                        ),
+                    ],
+                )
+                st.set(best_iteration=booster.best_iteration)
+
+            boosters.append(booster)
+            n_fit, n_fit_ents = fit.height, fit_ents.height
+            del fit, early, dtrain, dvalid
+
+            with progress.stage("predict-holdout") as st:
+                scored_fold, n_hold = predict_subset(
+                    booster, src, plan.filter(pl.col("_fold") == f)
+                )
+                st.set(rows=n_hold)
+            oof_parts.append(scored_fold)
+            del scored_fold
+
+            ap = next(iter(booster.best_score.get("early", {}).values()), float("nan"))
+            fold_st.set(rows=n_fit, fit_entities=n_fit_ents, holdout_rows=n_hold,
+                        best_iteration=booster.best_iteration,
+                        ap=None if ap != ap else round(float(ap), 6))
+            print(
+                f"    fold {f}: fit {n_fit:,} rows / {n_fit_ents:,} entities, "
+                f"scored {n_hold:,} held-out rows, best iter {booster.best_iteration}, "
+                f"AP {ap:.4f}   ({time.perf_counter() - t0:.1f}s)"
             )
-        if train_entities:
-            fit_ents = fit_ents.sort("_pick").head(train_entities)
-        # The early-stopping slice is 1/20 of the training folds and was also
-        # unbounded — 88k entities, 5M rows, another ~2.2GB. It only has to be
-        # large enough to detect overfitting, so it gets a quarter of the
-        # training budget.
-        if train_entities:
-            early_ents = early_ents.sort("_pick").head(max(train_entities // 4, 1))
+        fold_tick.advance(1, ap=None if ap != ap else round(float(ap), 4))
+    fold_tick.close()
 
-        fit = rows_for(fit_ents)
-        early = rows_for(early_ents)
-        dtrain = lgb.Dataset(_matrix(fit), label=fit["label"].to_numpy())
-        dvalid = lgb.Dataset(
-            _matrix(early), label=early["label"].to_numpy(), reference=dtrain
-        )
-        booster = lgb.train(
-            params,
-            dtrain,
-            num_boost_round=rounds,
-            valid_sets=[dvalid],
-            valid_names=["early"],
-            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)],
-        )
-        boosters.append(booster)
-        n_fit, n_fit_ents = fit.height, fit_ents.height
-        del fit, early, dtrain, dvalid
-
-        scored_fold, n_hold = predict_subset(
-            booster, src, plan.filter(pl.col("_fold") == f)
-        )
-        oof_parts.append(scored_fold)
-        del scored_fold
-
-        ap = next(iter(booster.best_score.get("early", {}).values()), float("nan"))
-        print(
-            f"    fold {f}: fit {n_fit:,} rows / {n_fit_ents:,} entities, "
-            f"scored {n_hold:,} held-out rows, best iter {booster.best_iteration}, "
-            f"AP {ap:.4f}   ({time.perf_counter() - t0:.1f}s)"
-        )
-
-    return boosters, pl.concat(oof_parts, how="vertical")
+    with progress.stage("concat-oof") as st:
+        oof = pl.concat(oof_parts, how="vertical")
+        st.set(rows=oof.height)
+    return boosters, oof
 
 
 def predict_subset(
@@ -457,9 +503,17 @@ def predict_subset(
     pf = pq.ParquetFile(src)
     parts: list[pl.DataFrame] = []
     n = 0
+    # Denominated in rows READ, not rows kept: the cursor walks the whole file
+    # and the semi-join discards ~4/5 of it, so total rows is what the position
+    # in the file is a fraction of. Tracking kept rows instead would show 20%
+    # when the pass was actually finished.
+    scanned = 0
+    tick = progress.ticker(pf.metadata.num_rows, unit="rows", label="score holdout")
     for batch in pf.iter_batches(batch_size=chunk):
         block = pl.from_arrow(batch).join(ids, on=ENT, how="semi")
+        scanned += batch.num_rows
         if block.is_empty():
+            tick.set(scanned, kept=n)
             continue
         p = booster.predict(_matrix(block), num_iteration=booster.best_iteration)
         parts.append(
@@ -467,6 +521,8 @@ def predict_subset(
         )
         n += block.height
         del block
+        tick.set(scanned, kept=n)
+    tick.close()
     if not parts:
         return pl.DataFrame(schema={ENT: pl.Utf8, CAND: pl.Utf8, "p": pl.Float32}), 0
     return pl.concat(parts, how="vertical"), n
@@ -505,6 +561,11 @@ def predict_ensemble(
     total = pf.metadata.num_rows
     parts = []
     seen = 0
+    # The single longest unbroken silence in the pipeline: every fold model
+    # scores every row, so this is n_folds passes of prediction over the full
+    # feature table with one `\r` line and no rate or ETA.
+    tick = progress.ticker(total, unit="rows",
+                           label=f"ensemble x{len(boosters)}")
     for batch in pf.iter_batches(batch_size=chunk):
         block = pl.from_arrow(batch)
         if block.is_empty():
@@ -517,8 +578,12 @@ def predict_ensemble(
         parts.append(
             block.select(ENT, CAND).with_columns(pl.Series("p", p, dtype=pl.Float32))
         )
-        print(f"    predicted {seen:,}/{total:,}", end="\r")
-    print()
+        tick.set(seen)
+        if not progress.console_enabled():
+            print(f"    predicted {seen:,}/{total:,}", end="\r")
+    tick.close()
+    if not progress.console_enabled():
+        print()
     if not parts:
         raise RuntimeError(f"{src} yielded no rows to predict on.")
     return pl.concat(parts, how="vertical")
@@ -614,6 +679,8 @@ def run(
     columns = pl.scan_parquet(src).limit(0).collect().columns
     n_rows = pl.scan_parquet(src).select(pl.len()).collect().item()
     print(f"  features: {n_rows:,} pairs, {len(FEATURE_COLUMNS)} columns")
+    progress.note("feature table", pairs=n_rows, columns=len(FEATURE_COLUMNS),
+                  parquet_gb=round(src.stat().st_size / 1_073_741_824, 3))
 
     if split == "train":
         if "label" not in columns:
@@ -621,17 +688,25 @@ def run(
                 f"{src} has no `label` column. Rebuild it with "
                 "`python -m src.features --split train`."
             )
-        boosters, scored = train_cv(
-            src, n_folds, train_entities, rounds, seed, train_rows=train_rows
-        )
+        with progress.stage("train-cv", folds=n_folds, rounds=rounds) as st:
+            boosters, scored = train_cv(
+                src, n_folds, train_entities, rounds, seed, train_rows=train_rows
+            )
+            st.set(rows=scored.height)
         save_models(boosters, work, DEFAULT_PARAMS)
         report_importance(boosters)
     else:
         boosters = load_models(work)
         print(f"  loaded {len(boosters)} boosters")
-        scored = predict_ensemble(boosters, src)
+        with progress.stage("predict-ensemble", boosters=len(boosters)) as st:
+            scored = predict_ensemble(boosters, src)
+            st.set(rows=scored.height)
 
-    return select_matches(scored, topk, coverage)
+    with progress.stage("select-matches", topk=topk,
+                        coverage=coverage) as st:
+        picked = select_matches(scored, topk, coverage)
+        st.set(rows=picked.height)
+    return picked
 
 
 def main() -> None:
@@ -673,18 +748,27 @@ def main() -> None:
                    help="Boosting round ceiling. Early stopping on an inner "
                         "slice of the training folds usually stops first.")
     p.add_argument("--seed", type=int, default=13)
+    progress.add_arguments(p)
     a = p.parse_args()
 
     work = paths.work_root(a.work_root)
     data = paths.data_root(a.data_root)
     out = paths.output_root(a.out_dir)
+    progress.configure_from_args(a, work, out, label=f"model:{a.split}")
     started = time.perf_counter()
     print(f"model [{a.split}]  work={work}")
 
-    pairs = run(
-        a.split, work, a.topk, a.coverage, a.folds,
-        a.train_entities or None, a.rounds, a.seed, a.train_rows or None,
-    )
+    # A top-level stage even though `run` opens its own: the stage path is built
+    # from the stack, so without one here the standalone entry point's records
+    # would be rooted differently from the same work run through `src.main`, and
+    # the two could not be compared in `timings.jsonl`.
+    with progress.stage("model", split=a.split, folds=a.folds,
+                        rounds=a.rounds) as st:
+        pairs = run(
+            a.split, work, a.topk, a.coverage, a.folds,
+            a.train_entities or None, a.rounds, a.seed, a.train_rows or None,
+        )
+        st.set(rows=pairs.height)
 
     # Imported here, not at module scope. `main` reaches into this module for
     # the `--scorer model` path, so a top-level import in the other direction
@@ -701,6 +785,7 @@ def main() -> None:
         print(f"\n  OUT-OF-FOLD MACRO F_0.5 = {score:.4f}")
         print("  (every entity scored by a model that did not train on it)")
     print(f"  done in {time.perf_counter() - started:.1f}s")
+    progress.shutdown()
 
 
 if __name__ == "__main__":
