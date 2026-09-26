@@ -62,7 +62,7 @@ from pathlib import Path
 
 import polars as pl
 
-from . import blocking, paths, text_norm, translit
+from . import blocking, minhash, paths, text_norm, translit
 
 SOURCE_COLUMNS = paths.SOURCE_COLUMNS
 # A key shared by more records than this carries almost no evidence and would
@@ -255,6 +255,11 @@ def load_prepared(
 # an unrecognised prefix raises instead of being silently dropped, which would
 # otherwise surface as a missing-column error deep inside blocking.
 _NAME_KEYS = tuple(k for k in blocking.KEY_COLUMNS if k.startswith("name_"))
+# LSH band signatures. They are blocking keys like any other, but no expression
+# builder in `text_norm` supplies them — they are a third pass over the
+# materialized trigram column, so they are split out here before the
+# name_/addr_ prefix check below can reject them.
+_BAND_KEYS = tuple(k for k in blocking.KEY_COLUMNS if blocking.is_band(k))
 # `addr_core` is both a candidate blocking key and the scorer's input. It is
 # deduped rather than selected twice, which polars rejects as a duplicate
 # column, and it is appended so it is present even when no address key blocks.
@@ -263,11 +268,13 @@ _ADDR_KEYS = tuple(
         [k for k in blocking.KEY_COLUMNS if k.startswith("addr_")] + ["addr_core"]
     )
 )
-_UNKNOWN = set(blocking.KEY_COLUMNS) - set(_NAME_KEYS) - set(_ADDR_KEYS)
+_UNKNOWN = (
+    set(blocking.KEY_COLUMNS) - set(_NAME_KEYS) - set(_ADDR_KEYS) - set(_BAND_KEYS)
+)
 if _UNKNOWN:
     raise ImportError(
-        f"blocking keys {sorted(_UNKNOWN)} match neither the name_ nor addr_ "
-        "prefix, so no expression builder supplies them."
+        f"blocking keys {sorted(_UNKNOWN)} match none of the name_, addr_ or "
+        f"{minhash.BAND_PREFIX} prefixes, so nothing supplies them."
     )
 
 # Columns the FEATURE stage needs that no blocking key asks for. They are
@@ -294,7 +301,9 @@ _TRIGRAM_COLUMN = "name_trigrams"
 # stage would put the 4-6 digit rule in two places.
 _ADDR_EXTRA: tuple[str, ...] = ("addr_token_count", "addr_numbers", "addr_postal")
 
-_COLLIDING = (set(_NAME_EXTRA) | set(_ADDR_EXTRA)) & (set(_NAME_KEYS) | set(_ADDR_KEYS))
+_COLLIDING = (set(_NAME_EXTRA) | set(_ADDR_EXTRA)) & (
+    set(_NAME_KEYS) | set(_ADDR_KEYS) | set(_BAND_KEYS)
+)
 if _COLLIDING:
     raise ImportError(
         f"{sorted(_COLLIDING)} is both a blocking key and a feature column; "
@@ -304,6 +313,7 @@ if _COLLIDING:
 NORMALIZED_COLUMNS: tuple[str, ...] = (
     "entity_id", "country_norm",
     *_NAME_KEYS, *_NAME_EXTRA, _TRIGRAM_COLUMN, *_ADDR_KEYS, *_ADDR_EXTRA,
+    *_BAND_KEYS,
 )
 
 if _TRIGRAM_SOURCE not in NORMALIZED_COLUMNS:
@@ -342,6 +352,23 @@ def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
     out = out.with_columns(
         text_norm.trigram_expression(_TRIGRAM_SOURCE).alias(_TRIGRAM_COLUMN)
     )
+    # THIRD pass, over the materialized trigram column, for the same reason the
+    # second pass exists. `band_expressions` fans out into bands*rows
+    # list.eval calls; built on top of the trigram EXPRESSION instead of its
+    # result, polars would recompute the `name_core` chain and all 48 trigram
+    # slices once per permutation — the session-4 failure, multiplied by 48
+    # rather than avoided. `band_expressions` takes a column name, so this is
+    # the only shape it can be called in.
+    #
+    # Measured marginal cost at the 250k chunk size this runs at: 9.2s per
+    # million rows for 48 permutations, flat from 250k to 500k. Extrapolated
+    # (not measured) to roughly +115s per split over the 186.5s the two
+    # existing passes take.
+    out = out.with_columns(
+        minhash.band_expressions(
+            _TRIGRAM_COLUMN, blocking.N_BANDS, minhash.DEFAULT_ROWS
+        )
+    )
     # Column order is load-bearing: every chunk is appended to the same parquet
     # writer, and a schema that differs between chunks fails the write. The
     # second pass appends its column at the end, so the order is restored by
@@ -361,6 +388,29 @@ def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
 POLARS_VERSION_KEY = b"amlc_polars_version"
 
 
+# Modules whose contents change what `prepare_full` writes. Adding `minhash`
+# here is not optional: the band signatures are stored in the normalized
+# parquet, so editing a permutation constant or `DEFAULT_ROWS` changes every
+# signature while leaving every file this list used to watch untouched.
+_RULE_MODULES: tuple[str, ...] = (
+    "text_norm.py", "translit.py", "blocking.py", "minhash.py", "main.py",
+)
+# Modules that demonstrably do NOT affect the normalized parquet. Listed rather
+# than left implicit so that a NEW module has to be classified deliberately:
+# the assertion below refuses to import if a file in `src/` is in neither list.
+#
+# This exists because the journal records exactly this bug — `_is_fresh`
+# compared the cache against the source TSV while its docstring claimed a
+# normalization change invalidated it, and a rule edit would have been reused
+# silently with the next measurement describing the old rules. The fix then was
+# to add the four files that mattered by hand, which is the same fix that would
+# have missed `minhash.py` today. A hand-maintained list of what matters fails
+# open; a list that must cover everything fails closed.
+_NOT_RULE_MODULES: tuple[str, ...] = (
+    "__init__.py", "paths.py", "block_eval.py", "features.py", "model.py",
+)
+
+
 def _rule_mtime() -> float:
     """Newest mtime among the modules that define the normalization rules.
 
@@ -372,9 +422,18 @@ def _rule_mtime() -> float:
     obviously wrong.
     """
     here = Path(__file__).resolve().parent
+    present = {p.name for p in here.glob("*.py")}
+    unclassified = present - set(_RULE_MODULES) - set(_NOT_RULE_MODULES)
+    if unclassified:
+        raise ImportError(
+            f"src/{sorted(unclassified)[0]} is in neither _RULE_MODULES nor "
+            "_NOT_RULE_MODULES. Decide whether editing it changes what "
+            "prepare_full writes: if it can, the normalized parquet cache must "
+            "be invalidated when it changes, and being left out of both lists "
+            "is how that guard silently stops covering the code it guards."
+        )
     return max(
-        (p.stat().st_mtime for p in (here / "text_norm.py", here / "translit.py",
-                                     here / "blocking.py", here / "main.py")
+        (p.stat().st_mtime for p in (here / n for n in _RULE_MODULES)
          if p.is_file()),
         default=0.0,
     )
@@ -624,19 +683,11 @@ def generate(
 
 
 def generate_multi(
-    split: str,
-    data: Path,
-    work: Path,
-    topk: int,
-    threshold: float,
-    budget: int,
-    max_bucket: int | None,
-    chunk: int,
-    merge_buckets: int,
-    keys: tuple[str, ...] | None,
-    reuse_candidates: bool = False,
-    acronym_cap: int | None = None,
-    acronym_min_len: int = 0,
+    split: str, data: Path, work: Path, topk: int, threshold: float,
+    budget: int, max_bucket: int | None, chunk: int, merge_buckets: int,
+    keys: tuple[str, ...] | None, reuse_candidates: bool = False,
+    acronym_cap: int | None = None, acronym_min_len: int = 0,
+    bands: int | None = None,
     char_ngram: bool = False,
     ngram_n: int = 5,
     ngram_max_bucket: int = 200,
@@ -675,7 +726,7 @@ def generate_multi(
     else:
         cand_path = blocking.block_split(
             split, work, budget, max_bucket, chunk, merge_buckets, keys,
-            acronym_cap, acronym_min_len,
+            acronym_cap, acronym_min_len, bands,
             char_ngram=char_ngram,
             ngram_n=ngram_n,
             ngram_max_bucket=ngram_max_bucket,
@@ -753,7 +804,7 @@ def generate_model(
     split: str, data: Path, work: Path, topk: int, budget: int,
     max_bucket: int | None, chunk: int, merge_buckets: int,
     keys: tuple[str, ...] | None, reuse_candidates: bool,
-    acronym_cap: int | None, acronym_min_len: int,
+    acronym_cap: int | None, acronym_min_len: int, bands: int | None,
     coverage: float, folds: int, train_entities: int | None,
     rounds: int, seed: int,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -782,7 +833,7 @@ def generate_model(
     else:
         blocking.block_split(
             split, work, budget, max_bucket, chunk, merge_buckets, keys,
-            acronym_cap, acronym_min_len,
+            acronym_cap, acronym_min_len, bands,
         )
 
     print("  features:")
@@ -986,6 +1037,14 @@ def main() -> None:
                         "cheap. NOT freshness-checked: the candidate file does "
                         "not record the budget, caps or keys it was built "
                         "with, so re-run blocking after changing any of them.")
+    p.add_argument("--bands", type=int, default=None,
+                   help=f"How many of the {blocking.N_BANDS} LSH band keys "
+                        "block, i.e. how hard the fuzzy stage tries. Default: "
+                        "all of them. 0 turns fuzzy retrieval OFF and "
+                        "reproduces the exact-key candidate set, which is the "
+                        "reference run this change has to be measured "
+                        "against. Bands are nested, so a curve over this needs "
+                        "no re-normalization. See src.minhash.")
     p.add_argument("--acronym-cap", type=int, default=None,
                    help="Bucket cap for name_acronym alone. See src.blocking.")
     p.add_argument("--acronym-min-len", type=int, default=0,
@@ -1099,6 +1158,16 @@ def main() -> None:
     if a.scorer == "model" and a.blocking != "multi":
         p.error("--scorer model reads the candidate and normalized parquet "
                 "that only --blocking multi produces.")
+    if a.keys and a.bands is not None:
+        p.error("pass --keys or --bands, not both: --keys already names the "
+                "exact band subset to block on.")
+    # The single-key path normalizes in memory and never writes a band column,
+    # so --bands is silently inert there rather than wrong. Refuse it for the
+    # same reason --legacy-norm and --scorer model are refused above: a flag
+    # that appears to do something and does nothing is worse than an error.
+    if a.bands is not None and a.blocking != "multi":
+        p.error("--bands applies to --blocking multi only; the single-key "
+                "path builds no LSH signatures.")
 
     started = time.perf_counter()
     if a.legacy_norm:
@@ -1109,6 +1178,12 @@ def main() -> None:
     print(f"  normalization: {mode}")
     print(f"  blocking: {a.blocking}"
           + (f"  budget={a.budget}" if a.blocking == "multi" else ""))
+    if a.blocking == "multi" and not a.keys:
+        n_b = blocking.N_BANDS if a.bands is None else a.bands
+        print(f"  fuzzy: {n_b}/{blocking.N_BANDS} LSH bands"
+              + (f" (rows={minhash.DEFAULT_ROWS}, detects trigram J=0.5 at "
+                 f"{minhash.detection_rate(0.5, n_b, minhash.DEFAULT_ROWS):.0%})"
+                 if n_b else " — OFF, exact keys only"))
     print(f"  scorer: {a.scorer}"
           + (f"  folds={a.folds}  coverage={a.coverage:g}"
              if a.scorer == "model" else f"  threshold={a.threshold:g}"))
@@ -1133,7 +1208,8 @@ def main() -> None:
             cands, matches = generate_model(
                 a.split, data, work, a.topk, a.budget, a.max_bucket, a.chunk,
                 a.merge_buckets, keys, a.reuse_candidates, a.acronym_cap,
-                a.acronym_min_len, a.coverage, a.folds,
+                a.acronym_min_len, a.bands if keys is None else None,
+                a.coverage, a.folds,
                 a.train_entities or None, a.rounds, a.seed,
             )
         else:
@@ -1141,20 +1217,16 @@ def main() -> None:
                 a.split, data, work, a.topk, a.threshold, a.budget,
                 a.max_bucket, a.chunk, a.merge_buckets, keys,
                 a.reuse_candidates, a.acronym_cap, a.acronym_min_len,
+                a.bands if keys is None else None,
+                char_ngram=a.char_ngram,
+                ngram_n=a.ngram_n,
+                ngram_max_bucket=a.ngram_max_bucket,
+                prefix=a.prefix,
+                prefix_len=a.prefix_len,
+                prefix_max_bucket=a.prefix_max_bucket,
+                tfidf=a.tfidf,
+                tfidf_top_k=a.tfidf_top_k,
             )
-        cands, matches = generate_multi(
-            a.split, data, work, a.topk, a.threshold, a.budget,
-            a.max_bucket, a.chunk, a.merge_buckets, keys,
-            a.reuse_candidates, a.acronym_cap, a.acronym_min_len,
-            char_ngram=a.char_ngram,
-            ngram_n=a.ngram_n,
-            ngram_max_bucket=a.ngram_max_bucket,
-            prefix=a.prefix,
-            prefix_len=a.prefix_len,
-            prefix_max_bucket=a.prefix_max_bucket,
-            tfidf=a.tfidf,
-            tfidf_top_k=a.tfidf_top_k,
-        )
     else:
         if a.normalize_only:
             p.error("--normalize-only applies to --blocking multi only.")

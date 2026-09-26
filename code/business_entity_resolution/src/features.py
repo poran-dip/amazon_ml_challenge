@@ -268,8 +268,22 @@ def _pair_features(df: pl.DataFrame) -> pl.DataFrame:
     """
     return df.with_columns(
         # ---- provenance, unpacked from the bitmask ------------------------
+        #
+        # The mask is cast UP to the current dtype before any bit is tested.
+        #
+        # A candidate parquet written before the LSH bands existed carries a
+        # UInt16 `key_mask`, which `--reuse-candidates` will happily read back
+        # since it is explicitly not freshness-checked. Measured, rather than
+        # assumed: `UInt16 & (1 << 20)` in polars raises nothing and returns
+        # False. For a pre-band candidate file that answer is correct — such a
+        # file really does contain no band hits — so this cast changes no
+        # result today. It is here so the correctness stops being an accident
+        # of two errors cancelling: the moment the mask dtype and the bit
+        # positions drift apart again, silent False is the failure mode, and it
+        # is indistinguishable from "the bands found nothing".
         *[
-            ((pl.col("key_mask") & blocking.KEY_BITS[k]) > 0)
+            (((pl.col("key_mask").cast(blocking.KEY_MASK_DTYPE))
+              & blocking.KEY_BITS[k]) > 0)
             .cast(pl.UInt8).alias(f"hit_{k}")
             for k in blocking.KEY_COLUMNS
         ],

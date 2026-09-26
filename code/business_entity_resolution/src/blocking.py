@@ -50,7 +50,52 @@ from pathlib import Path
 
 import polars as pl
 
-from . import paths
+from . import minhash, paths
+
+# How many LSH band keys exist. FIXED at module level, deliberately, even
+# though `--bands` selects how many actually block.
+#
+# `KEY_BITS` assigns one `key_mask` bit per key by position, and
+# `features.FEATURE_COLUMNS` derives one `hit_<key>` column per key from
+# `KEY_COLUMNS` — which `model.py` persists alongside the booster and refuses a
+# mismatch against. If the band count came from the CLI, the feature schema and
+# the meaning of every mask bit would change between two runs that differ only
+# in `--bands`, and a saved model would silently be read against the wrong
+# columns.
+#
+# So normalization always writes all `N_BANDS` signatures and `--bands N`
+# selects the first N. `minhash._coefficients` is a seeded stream, so the first
+# N bands of a 16-band run ARE the whole of an N-band run — the configurations
+# are nested, which is what makes a bands curve readable off one normalization
+# pass instead of one per point.
+N_BANDS = minhash.DEFAULT_BANDS
+BAND_KEYS: tuple[str, ...] = minhash.band_columns(N_BANDS)
+
+# Weight and cap for every band key. One shared pair rather than sixteen,
+# because the bands are exchangeable by construction — band 3 is not a more
+# informative permutation than band 11, so a per-band weight would be fitting
+# noise.
+#
+# The weight is the one genuinely open parameter in this change, and it is set
+# by the job `block_score` has to do rather than by tuning. Its ONLY use is
+# ranking an entity's candidates for the per-entity budget cut; the model gets
+# `key_mask` and `n_keys` and learns the real weighting itself. Two constraints
+# fix it to about this value:
+#
+#   * a true fuzzy-only match must outrank a same-building false positive. That
+#     false positive arrives through `addr_sorted` at 0.85/log2(1+bucket), so
+#     roughly 0.15 in a bucket of 50. A true match agreeing on 8 of 16 bands in
+#     small buckets scores about 8*0.10/1.5 = 0.53, and wins comfortably.
+#   * an exact name match should not be displaced by a merely similar one.
+#     Total band score saturates near 1.6 when all 16 agree, against
+#     `name_sorted`'s 1.0 — so only near-identical trigrams outrank identical
+#     sorted tokens, which is the intended ordering.
+#
+# The cap is tighter than the name keys' 2000. A band bucket holding 1000
+# records is 1000 records with near-identical 3-gram sets, which on this data
+# means a generic name rather than a cluster of true matches.
+BAND_WEIGHT = 0.10
+BAND_CAP = 1000
 
 # (column, weight, bucket cap).
 #
@@ -79,9 +124,27 @@ KEY_SPECS: tuple[tuple[str, float, int], ...] = (
     ("name_nospace", 0.80, 2000),
     ("addr_sorted", 0.85, 2000),
     ("name_acronym", 0.25, 50),
+    # LSH bands. Appended AFTER the exact keys so that every existing
+    # `key_mask` bit keeps the value it had before this change — an old
+    # candidate or feature parquet stays readable, and the diagnostics in
+    # `findings.md` that quote per-key contributions stay comparable.
+    *((k, BAND_WEIGHT, BAND_CAP) for k in BAND_KEYS),
 )
 
 KEY_COLUMNS: tuple[str, ...] = tuple(k for k, _, _ in KEY_SPECS)
+
+# The exact keys, as distinct from the fuzzy ones. `block_eval` reports the two
+# groups separately, since "what the exact keys reach" is the 76.26% ceiling
+# every number in `findings.md` is measured against and the point of this
+# change is to leave it behind.
+EXACT_KEYS: tuple[str, ...] = tuple(k for k in KEY_COLUMNS if k not in BAND_KEYS)
+
+# Band signatures are UInt64, every other key is Utf8. `blocking_key` and
+# `_usable` are the two places that care, and both dispatch on this rather than
+# on a schema lookup, matching how `main._NAME_KEYS`/`_ADDR_KEYS` already split
+# keys by prefix.
+def is_band(key: str) -> bool:
+    return key.startswith(minhash.BAND_PREFIX)
 
 # Which key found a pair, as one bit per key in a `key_mask` column.
 #
@@ -101,9 +164,22 @@ KEY_COLUMNS: tuple[str, ...] = tuple(k for k, _, _ in KEY_SPECS)
 #
 # Bits are indexed against KEY_COLUMNS, not against the selected subset, so a
 # mask means the same thing across runs that pass different `--keys`.
-assert len(KEY_SPECS) <= 16, (
-    "key_mask is a UInt16 — widen the dtype in _emit_key and _merge before "
-    "adding a 17th blocking key."
+#
+# The mask WAS a UInt16, which held the five exact keys with room to spare.
+# Sixteen band keys take the total to 21 and overflow it — bit 16 and up would
+# be truncated on the cast, so `hit_band_11` and everything after it would read
+# as a constant zero in `features.py`: no crash, no warning, and eleven model
+# features silently dead. Widened to UInt32 rather than sized exactly, so the
+# next few keys do not repeat this.
+KEY_MASK_DTYPE = pl.UInt32
+_MASK_BITS = 32
+assert len(KEY_SPECS) <= _MASK_BITS, (
+    f"key_mask is a {KEY_MASK_DTYPE} holding {_MASK_BITS} bits and there are "
+    f"{len(KEY_SPECS)} keys — widen the dtype in _emit_key and _merge before "
+    "adding another."
+)
+assert len(set(KEY_COLUMNS)) == len(KEY_COLUMNS), (
+    "duplicate blocking key name; two keys would share one key_mask bit"
 )
 KEY_BITS: dict[str, int] = {k: 1 << i for i, k in enumerate(KEY_COLUMNS)}
 
@@ -122,6 +198,24 @@ KEY_BITS: dict[str, int] = {k: 1 << i for i, k in enumerate(KEY_COLUMNS)}
 DEFAULT_KEYS: tuple[str, ...] = tuple(k for k in KEY_COLUMNS if k != "name_core")
 
 
+def default_keys(bands: int | None = None) -> tuple[str, ...]:
+    """The default key set with only the first `bands` band keys in it.
+
+    `bands=None` means all of them; `bands=0` turns the fuzzy stage off
+    entirely, which is what reproduces the pre-LSH candidate set and is how a
+    regression gets attributed to this change rather than bisected.
+    """
+    if bands is None:
+        return DEFAULT_KEYS
+    if not 0 <= bands <= N_BANDS:
+        raise ValueError(
+            f"--bands must be between 0 and {N_BANDS} (normalization writes "
+            f"{N_BANDS} signatures); got {bands}"
+        )
+    keep = set(BAND_KEYS[:bands])
+    return tuple(k for k in DEFAULT_KEYS if not is_band(k) or k in keep)
+
+
 # --------------------------------------------------------------------------
 # key construction
 # --------------------------------------------------------------------------
@@ -131,10 +225,21 @@ def blocking_key(key: str) -> pl.Expr:
 
     `concat_str` propagates nulls, so a null key value yields a null `bk` and is
     dropped by `_usable`. That is the intended behaviour, not an accident worth
-    working around.
+    working around — and it is load-bearing for the band keys, where a row
+    whose name normalized to nothing has an empty trigram list, hence a null
+    MinHash, hence a null signature. Without that propagation every blank name
+    in the corpus would share one signature and form a single enormous
+    spurious bucket.
     """
+    value = pl.col(key)
+    if is_band(key):
+        # Band signatures are UInt64 and `concat_str` will not take an integer
+        # column. The cast is transient — it exists only inside this join and
+        # is never stored, which is why the signatures live on disk as 8-byte
+        # integers rather than 20-character strings across 12.5M rows.
+        value = value.cast(pl.Utf8)
     return pl.concat_str(
-        [pl.col("country_norm").fill_null(""), pl.lit("|"), pl.col(key)]
+        [pl.col("country_norm").fill_null(""), pl.lit("|"), value]
     ).alias("bk")
 
 
@@ -154,6 +259,16 @@ def _usable(key: str, min_len: int = 0) -> pl.Expr:
     outright and then capping loosely targets the mechanism instead of the
     symptom.
     """
+    if is_band(key):
+        # A UInt64 signature has no length and `str.len_chars()` on it raises.
+        # Nullness is the whole test here and it is sufficient: an empty
+        # trigram list is the only way to reach a null signature, and there is
+        # no analogue of a "too short to mean much" band — every signature
+        # carries the same number of bits. `min_len` is meaningless for a band
+        # and passing one is a caller bug rather than something to ignore.
+        if min_len > 1:
+            raise ValueError(f"min_len does not apply to the band key {key!r}")
+        return pl.col(key).is_not_null()
     ok = pl.col(key).is_not_null() & (pl.col(key).str.len_chars() > 0)
     if min_len > 1:
         ok = ok & (pl.col(key).str.len_chars() >= min_len)
@@ -266,7 +381,7 @@ def _emit_key(
                 ).alias("w"),
                 # Provenance. Constant within this key's partial, and OR-ed
                 # together across keys by the merge.
-                pl.lit(KEY_BITS[key], dtype=pl.UInt16).alias("key_bit"),
+                pl.lit(KEY_BITS[key], dtype=KEY_MASK_DTYPE).alias("key_bit"),
             )
             if hits.is_empty():
                 continue
@@ -330,7 +445,8 @@ def _merge(
                 # present. Each bit is a distinct power of two, so summing them
                 # once each is exactly an OR; `unique` is what makes that hold
                 # under a repeated emission rather than only in the happy case.
-                pl.col("key_bit").unique().sum().cast(pl.UInt16).alias("key_mask"),
+                pl.col("key_bit").unique().sum().cast(KEY_MASK_DTYPE)
+                .alias("key_mask"),
             )
             .collect()
         )
@@ -633,6 +749,7 @@ def block_split(
     keys: tuple[str, ...] | None = None,
     acronym_cap: int | None = None,
     acronym_min_len: int = 0,
+    bands: int | None = None,
     char_ngram: bool = False,
     ngram_n: int = 5,
     ngram_max_bucket: int = 200,
@@ -642,8 +759,18 @@ def block_split(
     tfidf: bool = False,
     tfidf_top_k: int = 20,
 ) -> Path:
-    """Run stage A end to end and return the candidate parquet's path."""
-    selected = keys if keys is not None else DEFAULT_KEYS
+    """Run stage A end to end and return the candidate parquet's path.
+
+    `bands` trims the default key set to the first N LSH bands. An explicit
+    `keys` wins over it, because `--keys` is the attribution tool and it should
+    mean exactly what it says.
+    """
+    if keys is not None and bands is not None:
+        raise ValueError(
+            "pass --keys or --bands, not both: --keys already names the exact "
+            "band subset to block on."
+        )
+    selected = keys if keys is not None else default_keys(bands)
     specs = [s for s in KEY_SPECS if s[0] in selected]
     if not specs and not (char_ngram or prefix or tfidf):
         raise ValueError(f"no keys selected; available: {list(KEY_COLUMNS)}")
@@ -662,6 +789,28 @@ def block_split(
         raise FileNotFoundError(
             f"{missing[0]} missing — run `python -m src.main --split {split} "
             "--normalize-only` first."
+        )
+
+    # Check every selected key is actually IN the normalized parquet before
+    # doing any work. A cache written before the band columns existed is the
+    # expected way to get here, and without this the run dies inside the first
+    # `_emit_key` join with a bare ColumnNotFound after building a target
+    # table — several minutes in, naming a column rather than the cause.
+    #
+    # `main._rule_mtime` should already have invalidated such a cache, since
+    # both `main.py` and `blocking.py` changed. This is the belt to that
+    # braces: the journal records a normalization cache that was reused
+    # silently across a rule change, and the failure there was invisible rather
+    # than loud.
+    have = set(pl.scan_parquet(paths.normalized_parquet(split, 1, work))
+               .collect_schema().names())
+    absent = [k for k in selected if k not in have]
+    if absent:
+        raise RuntimeError(
+            f"the normalized parquet has no {absent[0]!r} column (and "
+            f"{len(absent) - 1} other selected key(s)). It predates these "
+            f"keys — re-run `python -m src.main --split {split} "
+            "--normalize-only --force-normalize`."
         )
 
     started = time.perf_counter()
@@ -730,6 +879,15 @@ def main() -> None:
         f"{','.join(k for k in KEY_COLUMNS if k not in DEFAULT_KEYS)}",
     )
     p.add_argument(
+        "--bands", type=int, default=None,
+        help=f"How many of the {N_BANDS} LSH band keys to block on (default: "
+        "all of them). 0 turns fuzzy retrieval off and reproduces the "
+        "exact-key candidate set, which is how a regression gets attributed "
+        "to this stage rather than bisected. The bands are NESTED — band k is "
+        "the same permutation group at every setting — so a curve over this "
+        "reads off one normalization pass. Mutually exclusive with --keys.",
+    )
+    p.add_argument(
         "--acronym-cap", type=int, default=None,
         help="Bucket cap for name_acronym alone (default: its KEY_SPECS value, "
         "50). At that cap the key agrees on 60.58%% of true pairs but only "
@@ -754,25 +912,37 @@ def main() -> None:
     a = p.parse_args()
 
     work = paths.work_root(a.work_root)
+    if a.keys and a.bands is not None:
+        p.error("pass --keys or --bands, not both.")
     keys = tuple(k.strip() for k in a.keys.split(",")) if a.keys else None
-    selected = keys if keys is not None else DEFAULT_KEYS
+    selected = keys if keys is not None else default_keys(a.bands)
+    # Twenty-one key names on one line is noise. The bands are exchangeable and
+    # share one weight and one cap, so they are summarized as a count and the
+    # exact keys are listed in full — which is what a reader is actually
+    # checking when they scan this header.
+    exact_sel = [k for k in selected if not is_band(k)]
+    n_band_sel = sum(1 for k in selected if is_band(k))
     caps = (
         f"global {a.max_bucket}"
         if a.max_bucket
         else ", ".join(
             f"{k}={a.acronym_cap or c if k == 'name_acronym' else c}"
             for k, _, c in KEY_SPECS
-            if k in selected
-        )
+            if k in exact_sel
+        ) + (f", {n_band_sel} bands={BAND_CAP}" if n_band_sel else "")
     )
     print(f"blocking [{a.split}]  work={work}  budget={a.budget}")
-    print(f"  keys: {', '.join(selected)}")
+    print(f"  exact keys: {', '.join(exact_sel) or '(none)'}")
+    print(f"  fuzzy: {n_band_sel}/{N_BANDS} LSH bands"
+          + (f" (rows={minhash.DEFAULT_ROWS}, weight {BAND_WEIGHT}, detects "
+             f"J=0.5 at {minhash.detection_rate(0.5, n_band_sel, minhash.DEFAULT_ROWS):.0%})"
+             if n_band_sel else " — fuzzy retrieval OFF"))
     print(f"  bucket caps: {caps}"
           + (f"   acronym min len: {a.acronym_min_len}"
              if a.acronym_min_len > 1 else ""))
     block_split(
         a.split, work, a.budget, a.max_bucket, a.chunk, a.merge_buckets, keys,
-        a.acronym_cap, a.acronym_min_len,
+        a.acronym_cap, a.acronym_min_len, a.bands if keys is None else None,
     )
 
 
