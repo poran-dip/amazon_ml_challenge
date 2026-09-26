@@ -127,6 +127,49 @@ Five resident key tables would be 3–5GB, so blocking loops key-outer instead: 
 
 The reader avoids two tempting APIs on purpose. `scan_csv(...).slice(offset, chunk).collect()` in a loop re-reads the file from the start every time — 42 passes over a 10M-row TSV. `read_csv_batched` is deprecated in current polars, and its replacement `LazyFrame.collect_batches` does not exist in 1.18, is documented as unstable, and warns that it is slower than the alternatives. Reading once and slicing the DataFrame is zero-copy and version-agnostic; outputs are verified identical on polars 1.18.0 and 1.44.2.
 
+## Where the score has to come from
+
+Measured on the full training split, 26 Sept 2026. Two complete runs, both
+self-scored out-of-fold:
+
+| | budget 20, exact keys | budget 60, 16 LSH bands |
+| --- | --- | --- |
+| blocking macro recall | 59.98% | **76.09%** |
+| F_0.5 ceiling over those candidates | 0.7943 | **0.8794** |
+| achieved out-of-fold | 0.7345 | **0.8121** |
+| mean candidates / entity | 10.89 | 56.36 |
+
+The model and selection stage delivers **92.47%** and **92.35%** of its
+ceiling respectively — a spread of 0.0012 across two runs with entirely
+different candidate sets. Treat 92.4% as the current conversion rate.
+
+Three measured facts set the strategy, and each one rules out a plausible plan:
+
+**Recall cannot exceed 89.15% with the current keys.** The union of all 21 keys
+reaches 82.62% at today's caps and 89.15% with every cap removed; **10.85% of
+true pairs are unreachable by any of them at any cap**. Of the 76.23% delivered,
+the per-entity budget is withholding 6.39% and the bucket caps 6.53%. So raising
+caps and budget — the only parameters available — tops out below 90%, and both
+enlarge `candidate_pairs.tsv`, which is now scored. **A 95% target needs a new
+retrieval mechanism, not a sweep.**
+
+**At 92.4% conversion, perfect blocking yields 0.9241.** Recall raises the
+ceiling; only the model collects it. So the model must improve *in parallel*
+with blocking, not after it — there are 7.6 points of achievable score left on
+the floor at every recall level.
+
+**A flat-zero entity bounds everything.** 137,007 entities (6.21% of all) have
+no true candidate and score zero whatever the model does, so macro F_0.5 ≤
+0.9379 today before the model is considered. For 0.99 that share must fall below
+~1%, i.e. "entities with all matches found" must go from 51.64% to ~99%.
+F_0.5 = 0.99 requires ~99% recall *and* ~99.5% conversion simultaneously; 0.95
+requires ≥92% recall at 99% conversion and is unreachable at 92.4%.
+
+The realistic near-term target is **~0.88**, from recall work plus the model
+improvements that convert it. `claude/recall-strategy.md` in the project holds
+the candidate directions; `claude/timings-baseline.md` holds the measured cost
+of every stage.
+
 ## Working on it
 
 One change at a time, measured against the run it replaces, with the previous behaviour reachable behind a flag rather than deleted. That is what makes a regression attributable instead of something to bisect.

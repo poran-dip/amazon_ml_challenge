@@ -353,10 +353,6 @@ def budget_curve(
         truth_eager.group_by("source1_entity_id").len().rename({"len": "n_true"})
     )
 
-    _section("macro recall vs per-entity budget (same candidate file)")
-    print(f"{'budget':>8} {'macro recall':>14} {'pair recall':>13} "
-          f"{'candidates':>13} {'mean/entity':>12}")
-    observed: list[tuple[int, float]] = []
     n_true_total = int(n_true_per_entity["n_true"].sum())
     # Per-entity candidate counts, once, so the "candidates" column at each cut
     # is sum(min(count, k)) rather than the height of a materialized cut.
@@ -364,6 +360,32 @@ def budget_curve(
         pl.scan_parquet(cand_path).group_by("source1_entity_id").len()
         .select(pl.col("len")).collect().to_series()
     )
+
+    # The curve is clamped to what this FILE can answer, and always includes the
+    # cap it was written at.
+    #
+    # Neither was true before, and the combination printed advice that
+    # contradicted the data. The default cuts stop at 30; a budget-60 file was
+    # therefore read only up to 30, the last two points still differed, and the
+    # footer said "still climbing -- re-run blocking with a larger --budget"
+    # about a run that had ALREADY been done at 60. Cuts at or below the file's
+    # cap need no re-blocking, so the cap belongs in the curve. Cuts above it
+    # are unanswerable from this file and used to be printed anyway, silently
+    # repeating the cap's own row under a larger label.
+    file_cap = int(ent_sizes.max() or 0)
+    if file_cap:
+        asked = tuple(cuts)
+        cuts = tuple(sorted({c for c in asked if 0 < c <= file_cap} | {file_cap}))
+        dropped = [c for c in asked if c > file_cap]
+        if dropped:
+            print(f"\n  NOTE: cuts {dropped} exceed this file's cap ({file_cap}) "
+                  "and cannot be read off it — they need another blocking run. "
+                  "Dropped.")
+
+    _section("macro recall vs per-entity budget (same candidate file)")
+    print(f"{'budget':>8} {'macro recall':>14} {'pair recall':>13} "
+          f"{'candidates':>13} {'mean/entity':>12}")
+    observed: list[tuple[int, float]] = []
     for k in cuts:
         found = (
             matched.filter(pl.col("rank") < k)
@@ -397,8 +419,10 @@ def budget_curve(
         print("  scorer to reject. Recall is limited by what the keys reach.")
     else:
         print(f"\n  STILL CLIMBING between {k0} and {k1} (+{gain:.2%}). The budget is")
-        print("  evicting true matches; re-run blocking with a larger --budget")
-        print("  (cuts above the budget cannot be read off this file).")
+        print("  evicting true matches, so a larger --budget would recover some")
+        print("  (cuts above this file's cap need another blocking run).")
+        print("  Weigh it against `mean candidates per entity`, which is now a")
+        print("  SCORED quantity: a smaller candidate set per entity ranks higher.")
 
 
 def key_diagnostics(
