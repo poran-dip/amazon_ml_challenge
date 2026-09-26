@@ -50,6 +50,14 @@ Each key carries a weight and its own bucket cap, and a candidate's score is the
 
 Country is folded into every key rather than compared separately: it agrees on 100% of true training pairs, so it is a free hard partition. It is treated as an opaque label and never enumerated, because the test set contains France and the training set does not.
 
+**Fuzzy retrieval** (`minhash.py`) is what reaches the true pairs no exact key can. 23.74% of true pairs are unreachable by any exact key at any cap or budget, and the failures are character-level — typos (`fnesnius`/`fresenius`), concatenation (`dentcoffee`/`coffee dent`), transliteration residue (`kanstraksans`/`constructions`), web debris (`com jgsreal`/`jgs real`). MinHash reduces each entity's character-3-gram set to 48 integers such that two entities' MinHashes agree with probability exactly equal to their Jaccard similarity; grouping those into 16 bands of 3 and requiring a whole band to agree turns a *similarity* question into an *equality* question. So each band signature is an ordinary exact blocking key and the stage above handles it unchanged — same key-outer join, same bucket cap, same inverse-frequency weighting, same budget. No new dependency.
+
+Two design choices worth knowing. An inverted index over the 3-grams was rejected on measurement, not taste: the vocabulary is 15,285 distinct grams over ~258M target postings, so mean document frequency is ~17,000 and there are no rare grams to invert on. And `P_MOD` is `2**31-1` rather than a larger prime because **polars wraps UInt64 silently** — at `2**61-1` a permutation overflows and yields a hash family that is neither the intended one nor provably anything, with no exception raised.
+
+A property that falls out free: a genuinely similar pair agrees on many bands, and `block_score` sums the weight of every key that found a pair, so it becomes a monotone estimator of trigram similarity rather than a flat count (measured `corr(n_bands, Jaccard) = 0.90`). That is exactly what the per-entity budget needs to rank on.
+
+`--bands N` blocks on the first N bands; `--bands 0` turns fuzzy retrieval off and reproduces the exact-key candidate set bit-for-bit, which is how a regression is attributed to this stage rather than bisected. The bands are **nested** — band *k* is the same permutation group at every setting — so a curve over `--bands` reads off one normalization pass instead of one per point.
+
 **Score** (`_jaccard`) is the token-set overlap of `addr_core`. **Predict** (`generate`) keeps pairs at or above `--threshold`, best `--topk` per entity. **Evaluate** (`macro_f05`) reports macro F_0.5 plus macro precision, macro recall, the share of entities given an empty prediction, how many of those have real matches, and mean predicted versus true count.
 
 ## Knobs
@@ -102,4 +110,6 @@ One change at a time, measured against the run it replaces, with the previous be
 
 The stage boundaries are where the next changes go. A fuzzy candidate stage appends to the candidate set before scoring, targeting the true pairs that no exact key reaches at any cap — and `--translit` becomes worth turning on at that moment and not before. A learned scorer replaces `_jaccard` and the threshold comparison with a model over several pair features, including `block_score` and `n_keys`; nothing has been trained yet, so no precision figure from a model exists.
 
-`claude/findings.md` in the project holds the measured numbers behind all of the above. The `feat/full-pipeline` branch still has a FAISS n-gram fuzzy stage that has not been reintroduced here.
+`claude/findings.md` in the project holds the measured numbers behind all of the above.
+
+The fuzzy stage is now MinHash/LSH in `minhash.py` (see **Block** above), not the FAISS n-gram stage that was on `feat/full-pipeline`. That approach was dropped on measurement rather than preference: its truncated-SVD basis captured 34.3% of variance, so retrieval ran against a lossy projection of the similarity it was measuring, and it needed two dependencies with no GPU wheels on Windows. LSH banding needs neither, and computes exact 3-gram agreement rather than an approximation of it.

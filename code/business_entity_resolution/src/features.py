@@ -87,7 +87,7 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     # provenance
     "block_score", "n_keys",
     *(f"hit_{k}" for k in blocking.KEY_COLUMNS),
-    "addr_only",
+    "addr_only", "n_band_hits",
     # name evidence
     "name_tri_jac", "name_tri_cont",
     "name_tok_jac", "name_tok_cont",
@@ -268,8 +268,22 @@ def _pair_features(df: pl.DataFrame) -> pl.DataFrame:
     """
     return df.with_columns(
         # ---- provenance, unpacked from the bitmask ------------------------
+        #
+        # The mask is cast UP to the current dtype before any bit is tested.
+        #
+        # A candidate parquet written before the LSH bands existed carries a
+        # UInt16 `key_mask`, which `--reuse-candidates` will happily read back
+        # since it is explicitly not freshness-checked. Measured, rather than
+        # assumed: `UInt16 & (1 << 20)` in polars raises nothing and returns
+        # False. For a pre-band candidate file that answer is correct — such a
+        # file really does contain no band hits — so this cast changes no
+        # result today. It is here so the correctness stops being an accident
+        # of two errors cancelling: the moment the mask dtype and the bit
+        # positions drift apart again, silent False is the failure mode, and it
+        # is indistinguishable from "the bands found nothing".
         *[
-            ((pl.col("key_mask") & blocking.KEY_BITS[k]) > 0)
+            (((pl.col("key_mask").cast(blocking.KEY_MASK_DTYPE))
+              & blocking.KEY_BITS[k]) > 0)
             .cast(pl.UInt8).alias(f"hit_{k}")
             for k in blocking.KEY_COLUMNS
         ],
@@ -289,6 +303,23 @@ def _pair_features(df: pl.DataFrame) -> pl.DataFrame:
                 ) == 0
             )
         ).cast(pl.UInt8).alias("addr_only"),
+
+        # How many LSH bands found this pair. This is not redundant with the
+        # individual `hit_band_*` flags: the bands are exchangeable, so which
+        # ones agreed carries no information and only the COUNT does — and a
+        # tree would need sixteen splits to reconstruct a sum it can otherwise
+        # read in one.
+        #
+        # It is also the most directly useful number the fuzzy stage produces.
+        # P[a band agrees] is exactly the trigram Jaccard raised to `rows`, so
+        # the count is an unbiased estimator of similarity, measured at
+        # corr(n_bands, J) = 0.90. `name_tri_jac` computes that Jaccard
+        # exactly, so the two overlap — but this one is defined for pairs the
+        # trigram lists disagree about in ways Jaccard flattens, and it costs
+        # one column.
+        pl.sum_horizontal(
+            [pl.col(f"hit_{k}") for k in blocking.BAND_KEYS]
+        ).cast(pl.Float32).alias("n_band_hits"),
 
         # ---- name evidence ------------------------------------------------
         *_jaccard_and_containment("tri_e", "tri_c", "name_tri_jac", "name_tri_cont"),
@@ -450,6 +481,13 @@ def build_features(
         )
         print(f"  ground truth: {truth.height:,} true pairs")
 
+    cand_cols = set(pl.scan_parquet(cand_path).collect_schema().names())
+    has_bucket = "bucket" in cand_cols
+    if not has_bucket:
+        print("    candidate file predates the `bucket` column — falling back "
+              "to a recomputed hash, which re-reads it once per bucket. "
+              "Re-run src.blocking to avoid that.")
+
     dst = paths.features_parquet(split, work)
     import pyarrow.parquet as pq
 
@@ -458,11 +496,25 @@ def build_features(
     positives = 0
     try:
         for b in range(merge_buckets):
+            # Filter on the materialized `bucket` column that blocking now
+            # writes, NOT on a recomputed hash. The hash version forced a full
+            # read and decode of the candidate file on every one of the
+            # merge_buckets iterations, because parquet cannot push down a
+            # predicate over a computed expression. `bucket` is a real column
+            # written in bucket order, so row-group statistics skip the rest.
+            #
+            # Falls back to the hash for a candidate file written before that
+            # column existed, which --reuse-candidates will happily hand over.
             chunk = (
                 pl.scan_parquet(cand_path)
-                .filter((pl.col("source1_entity_id").hash() % merge_buckets) == b)
+                .filter(
+                    (pl.col("bucket") == b) if has_bucket
+                    else ((pl.col("source1_entity_id").hash() % merge_buckets) == b)
+                )
                 .collect()
             )
+            if has_bucket and not chunk.is_empty():
+                chunk = chunk.drop("bucket")
             if chunk.is_empty():
                 continue
             # Inner joins on both sides. A candidate whose attributes are

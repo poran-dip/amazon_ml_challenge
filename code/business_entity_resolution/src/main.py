@@ -62,7 +62,7 @@ from pathlib import Path
 
 import polars as pl
 
-from . import blocking, paths, text_norm, translit
+from . import blocking, minhash, paths, text_norm, translit
 
 SOURCE_COLUMNS = paths.SOURCE_COLUMNS
 # A key shared by more records than this carries almost no evidence and would
@@ -255,6 +255,11 @@ def load_prepared(
 # an unrecognised prefix raises instead of being silently dropped, which would
 # otherwise surface as a missing-column error deep inside blocking.
 _NAME_KEYS = tuple(k for k in blocking.KEY_COLUMNS if k.startswith("name_"))
+# LSH band signatures. They are blocking keys like any other, but no expression
+# builder in `text_norm` supplies them — they are a third pass over the
+# materialized trigram column, so they are split out here before the
+# name_/addr_ prefix check below can reject them.
+_BAND_KEYS = tuple(k for k in blocking.KEY_COLUMNS if blocking.is_band(k))
 # `addr_core` is both a candidate blocking key and the scorer's input. It is
 # deduped rather than selected twice, which polars rejects as a duplicate
 # column, and it is appended so it is present even when no address key blocks.
@@ -263,11 +268,13 @@ _ADDR_KEYS = tuple(
         [k for k in blocking.KEY_COLUMNS if k.startswith("addr_")] + ["addr_core"]
     )
 )
-_UNKNOWN = set(blocking.KEY_COLUMNS) - set(_NAME_KEYS) - set(_ADDR_KEYS)
+_UNKNOWN = (
+    set(blocking.KEY_COLUMNS) - set(_NAME_KEYS) - set(_ADDR_KEYS) - set(_BAND_KEYS)
+)
 if _UNKNOWN:
     raise ImportError(
-        f"blocking keys {sorted(_UNKNOWN)} match neither the name_ nor addr_ "
-        "prefix, so no expression builder supplies them."
+        f"blocking keys {sorted(_UNKNOWN)} match none of the name_, addr_ or "
+        f"{minhash.BAND_PREFIX} prefixes, so nothing supplies them."
     )
 
 # Columns the FEATURE stage needs that no blocking key asks for. They are
@@ -294,7 +301,9 @@ _TRIGRAM_COLUMN = "name_trigrams"
 # stage would put the 4-6 digit rule in two places.
 _ADDR_EXTRA: tuple[str, ...] = ("addr_token_count", "addr_numbers", "addr_postal")
 
-_COLLIDING = (set(_NAME_EXTRA) | set(_ADDR_EXTRA)) & (set(_NAME_KEYS) | set(_ADDR_KEYS))
+_COLLIDING = (set(_NAME_EXTRA) | set(_ADDR_EXTRA)) & (
+    set(_NAME_KEYS) | set(_ADDR_KEYS) | set(_BAND_KEYS)
+)
 if _COLLIDING:
     raise ImportError(
         f"{sorted(_COLLIDING)} is both a blocking key and a feature column; "
@@ -304,6 +313,7 @@ if _COLLIDING:
 NORMALIZED_COLUMNS: tuple[str, ...] = (
     "entity_id", "country_norm",
     *_NAME_KEYS, *_NAME_EXTRA, _TRIGRAM_COLUMN, *_ADDR_KEYS, *_ADDR_EXTRA,
+    *_BAND_KEYS,
 )
 
 if _TRIGRAM_SOURCE not in NORMALIZED_COLUMNS:
@@ -342,6 +352,23 @@ def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
     out = out.with_columns(
         text_norm.trigram_expression(_TRIGRAM_SOURCE).alias(_TRIGRAM_COLUMN)
     )
+    # THIRD pass, over the materialized trigram column, for the same reason the
+    # second pass exists. `band_expressions` fans out into bands*rows
+    # list.eval calls; built on top of the trigram EXPRESSION instead of its
+    # result, polars would recompute the `name_core` chain and all 48 trigram
+    # slices once per permutation — the session-4 failure, multiplied by 48
+    # rather than avoided. `band_expressions` takes a column name, so this is
+    # the only shape it can be called in.
+    #
+    # Measured marginal cost at the 250k chunk size this runs at: 9.2s per
+    # million rows for 48 permutations, flat from 250k to 500k. Extrapolated
+    # (not measured) to roughly +115s per split over the 186.5s the two
+    # existing passes take.
+    out = out.with_columns(
+        minhash.band_expressions(
+            _TRIGRAM_COLUMN, blocking.N_BANDS, minhash.DEFAULT_ROWS
+        )
+    )
     # Column order is load-bearing: every chunk is appended to the same parquet
     # writer, and a schema that differs between chunks fails the write. The
     # second pass appends its column at the end, so the order is restored by
@@ -359,6 +386,43 @@ def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
 # `_is_fresh`. See the comment there for why a library version has to be part
 # of the cache key when a hash is part of the payload.
 POLARS_VERSION_KEY = b"amlc_polars_version"
+# Whether the cache was built with romanization on. Stamped for the same
+# reason the polars version is, and closing a gap the previous docstring
+# merely APOLOGISED for: "toggling --translit changes the output without
+# touching any file, so it does not invalidate the cache. --force-normalize is
+# the answer there."
+#
+# Documenting a footgun is not removing it. --translit rewrites every name and
+# address before normalization, so it changes name_core, every blocking key,
+# the trigrams and therefore all sixteen LSH band signatures — and none of the
+# three existing guards can see it, because it touches no file, changes no row
+# count and is not a library version. Forgetting --force-normalize on a run
+# that toggles it silently measures the OTHER setting, which is precisely the
+# class of bug this project has hit in sessions 3, 4 and 5.
+TRANSLIT_KEY = b"amlc_translit"
+
+
+# Modules whose contents change what `prepare_full` writes. Adding `minhash`
+# here is not optional: the band signatures are stored in the normalized
+# parquet, so editing a permutation constant or `DEFAULT_ROWS` changes every
+# signature while leaving every file this list used to watch untouched.
+_RULE_MODULES: tuple[str, ...] = (
+    "text_norm.py", "translit.py", "blocking.py", "minhash.py", "main.py",
+)
+# Modules that demonstrably do NOT affect the normalized parquet. Listed rather
+# than left implicit so that a NEW module has to be classified deliberately:
+# the assertion below refuses to import if a file in `src/` is in neither list.
+#
+# This exists because the journal records exactly this bug — `_is_fresh`
+# compared the cache against the source TSV while its docstring claimed a
+# normalization change invalidated it, and a rule edit would have been reused
+# silently with the next measurement describing the old rules. The fix then was
+# to add the four files that mattered by hand, which is the same fix that would
+# have missed `minhash.py` today. A hand-maintained list of what matters fails
+# open; a list that must cover everything fails closed.
+_NOT_RULE_MODULES: tuple[str, ...] = (
+    "__init__.py", "paths.py", "block_eval.py", "features.py", "model.py",
+)
 
 
 def _rule_mtime() -> float:
@@ -372,15 +436,27 @@ def _rule_mtime() -> float:
     obviously wrong.
     """
     here = Path(__file__).resolve().parent
+    present = {p.name for p in here.glob("*.py")}
+    unclassified = present - set(_RULE_MODULES) - set(_NOT_RULE_MODULES)
+    if unclassified:
+        raise ImportError(
+            f"src/{sorted(unclassified)[0]} is in neither _RULE_MODULES nor "
+            "_NOT_RULE_MODULES. Decide whether editing it changes what "
+            "prepare_full writes: if it can, the normalized parquet cache must "
+            "be invalidated when it changes, and being left out of both lists "
+            "is how that guard silently stops covering the code it guards."
+        )
     return max(
-        (p.stat().st_mtime for p in (here / "text_norm.py", here / "translit.py",
-                                     here / "blocking.py", here / "main.py")
+        (p.stat().st_mtime for p in (here / n for n in _RULE_MODULES)
          if p.is_file()),
         default=0.0,
     )
 
 
-def _is_fresh(parquet: Path, source: Path, expected_rows: int | None) -> bool:
+def _is_fresh(
+    parquet: Path, source: Path, expected_rows: int | None,
+    use_translit: bool = False,
+) -> bool:
     """Whether a cached parquet can be reused.
 
     Three guards, all earned. The cache must be newer than the source data AND
@@ -402,7 +478,9 @@ def _is_fresh(parquet: Path, source: Path, expected_rows: int | None) -> bool:
 
         pf = pq.ParquetFile(parquet)
         rows = pf.metadata.num_rows
-        stamped = (pf.schema_arrow.metadata or {}).get(POLARS_VERSION_KEY, b"")
+        meta = pf.schema_arrow.metadata or {}
+        stamped = meta.get(POLARS_VERSION_KEY, b"")
+        stamped_translit = meta.get(TRANSLIT_KEY)
     except Exception:
         return False
     # `name_trigrams` holds polars hash values, and a hash is only meaningful
@@ -414,6 +492,12 @@ def _is_fresh(parquet: Path, source: Path, expected_rows: int | None) -> bool:
     # above cannot see this, because upgrading a library touches none of the
     # files they watch.
     if stamped.decode(errors="replace") != pl.__version__:
+        return False
+    # A cache with no translit stamp predates this guard and cannot be
+    # vouched for either way, so it is rebuilt once rather than trusted.
+    if stamped_translit is None:
+        return False
+    if stamped_translit != (b"1" if use_translit else b"0"):
         return False
     return expected_rows is None or rows == expected_rows
 
@@ -457,7 +541,7 @@ def ensure_normalized(
             None if available is None
             else (min(limit, available) if limit else available)
         )
-        if not force and _is_fresh(dst, src, expected):
+        if not force and _is_fresh(dst, src, expected, use_translit):
             shape = f"{expected:,} rows" if expected is not None else "row count unverified"
             print(f"  source{source}: reusing {dst.name} ({shape})")
             continue
@@ -473,9 +557,10 @@ def ensure_normalized(
                 # Stamp every chunk, not just the first: the writer is created
                 # from the first chunk's schema and pyarrow requires each
                 # subsequent table's schema to match it, metadata included.
-                table = table.replace_schema_metadata(
-                    {POLARS_VERSION_KEY: pl.__version__.encode()}
-                )
+                table = table.replace_schema_metadata({
+                    POLARS_VERSION_KEY: pl.__version__.encode(),
+                    TRANSLIT_KEY: b"1" if use_translit else b"0",
+                })
                 if writer is None:
                     writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
                 writer.write_table(table)
@@ -623,20 +708,32 @@ def generate(
     return cands, matches
 
 
+def _has_bucket_col(cand_path: Path) -> bool:
+    """Whether the candidate parquet carries blocking's `bucket` column.
+
+    Cached because it is called inside the per-bucket loop and a schema read
+    is a file open. Keyed on the path AND its mtime, so re-running blocking
+    inside one process does not serve a stale answer.
+    """
+    key = (str(cand_path), cand_path.stat().st_mtime_ns)
+    hit = _BUCKET_COL_CACHE.get(key)
+    if hit is None:
+        hit = "bucket" in pl.scan_parquet(cand_path).collect_schema().names()
+        _BUCKET_COL_CACHE[key] = hit
+    return hit
+
+
+_BUCKET_COL_CACHE: dict[tuple[str, int], bool] = {}
+
+
 def generate_multi(
-    split: str,
-    data: Path,
-    work: Path,
-    topk: int,
-    threshold: float,
-    budget: int,
-    max_bucket: int | None,
-    chunk: int,
-    merge_buckets: int,
-    keys: tuple[str, ...] | None,
-    reuse_candidates: bool = False,
-    acronym_cap: int | None = None,
-    acronym_min_len: int = 0,
+    split: str, data: Path, work: Path, topk: int, threshold: float,
+    budget: int, max_bucket: int | None, chunk: int, merge_buckets: int,
+    keys: tuple[str, ...] | None, reuse_candidates: bool = False,
+    acronym_cap: int | None = None, acronym_min_len: int = 0,
+    bands: int | None = None, band_min_hits: int = 1,
+    band_cap: int | None = None, max_pairs: int | None = None,
+    max_total: int | None = None,
     char_ngram: bool = False,
     ngram_n: int = 5,
     ngram_max_bucket: int = 200,
@@ -675,7 +772,8 @@ def generate_multi(
     else:
         cand_path = blocking.block_split(
             split, work, budget, max_bucket, chunk, merge_buckets, keys,
-            acronym_cap, acronym_min_len,
+            acronym_cap, acronym_min_len, bands, band_min_hits, band_cap,
+            max_pairs, max_total,
             char_ngram=char_ngram,
             ngram_n=ngram_n,
             ngram_max_bucket=ngram_max_bucket,
@@ -711,9 +809,16 @@ def generate_multi(
     # isolation. This keeps the join output bounded instead of materializing
     # ~44M scored pairs at once.
     for b in range(merge_buckets):
+        # Same fix as `features.build_features`: filter on the materialized
+        # `bucket` column when blocking wrote one, so parquet row-group
+        # statistics skip the rest of the file instead of this decoding the
+        # whole candidate set once per bucket.
         chunk_df = (
             pl.scan_parquet(cand_path)
-            .filter((pl.col("source1_entity_id").hash() % merge_buckets) == b)
+            .filter(
+                (pl.col("bucket") == b) if _has_bucket_col(cand_path)
+                else ((pl.col("source1_entity_id").hash() % merge_buckets) == b)
+            )
             .collect()
         )
         if chunk_df.is_empty():
@@ -753,9 +858,10 @@ def generate_model(
     split: str, data: Path, work: Path, topk: int, budget: int,
     max_bucket: int | None, chunk: int, merge_buckets: int,
     keys: tuple[str, ...] | None, reuse_candidates: bool,
-    acronym_cap: int | None, acronym_min_len: int,
-    coverage: float, folds: int, train_entities: int | None,
-    rounds: int, seed: int,
+    acronym_cap: int | None, acronym_min_len: int, bands: int | None,
+    band_min_hits: int, band_cap: int | None, max_pairs: int | None,
+    max_total: int | None, coverage: float, folds: int, train_entities: int | None,
+    rounds: int, seed: int, train_rows: int | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Multi-key blocking, then features, then the learned scorer.
 
@@ -782,14 +888,16 @@ def generate_model(
     else:
         blocking.block_split(
             split, work, budget, max_bucket, chunk, merge_buckets, keys,
-            acronym_cap, acronym_min_len,
+            acronym_cap, acronym_min_len, bands, band_min_hits, band_cap,
+            max_pairs, max_total,
         )
 
     print("  features:")
     feature_stage.build_features(split, work, data, merge_buckets)
     print("  model:")
     matches = model_stage.run(
-        split, work, topk, coverage, folds, train_entities, rounds, seed
+        split, work, topk, coverage, folds, train_entities, rounds, seed,
+        train_rows,
     ).rename({"source1_entity_id": "entity_id"})
 
     # The candidate file is the deliverable for `candidate_pairs.tsv`, which is
@@ -986,6 +1094,37 @@ def main() -> None:
                         "cheap. NOT freshness-checked: the candidate file does "
                         "not record the budget, caps or keys it was built "
                         "with, so re-run blocking after changing any of them.")
+    p.add_argument("--bands", type=int, default=None,
+                   help=f"How many of the {blocking.N_BANDS} LSH band keys "
+                        "block, i.e. how hard the fuzzy stage tries. Default: "
+                        "all of them. 0 turns fuzzy retrieval OFF and "
+                        "reproduces the exact-key candidate set, which is the "
+                        "reference run this change has to be measured "
+                        "against. Bands are nested, so a curve over this needs "
+                        "no re-normalization. See src.minhash.")
+    p.add_argument("--max-pairs-total", type=int, default=1_500_000_000,
+                   help="Refuse a key set projected to emit more than this "
+                        "many raw pairs in total. THE guard that matters: at "
+                        "--band-cap 1000 each band projects ~212M, under any "
+                        "sane per-key limit, while sixteen come to 3.4 "
+                        "billion. 0 disables. See src.blocking.")
+    p.add_argument("--max-pairs-per-key", type=int, default=400_000_000,
+                   help="Refuse to emit a blocking key projected to produce "
+                        "more than this many raw pairs. The projection is "
+                        "exact and costs a one-row aggregation, so an "
+                        "oversized configuration fails in seconds rather than "
+                        "an hour in. 0 disables. See src.blocking.")
+    p.add_argument("--band-cap", type=int, default=None,
+                   help="Bucket cap for every LSH band. The fan-out knob: "
+                        "pairs per entity per band is the SIZE-BIASED mean "
+                        "bucket size, which at cap 1000 measured 98.5 against "
+                        "a plain mean of 3.95. See src.blocking.")
+    p.add_argument("--band-min-hits", type=int, default=1,
+                   help="How many LSH bands must agree before a pair with no "
+                        "exact-key evidence becomes a candidate. The "
+                        "candidate-set-SIZE knob: raising it shrinks the fuzzy "
+                        "half sharply while barely touching high-similarity "
+                        "pairs. See src.blocking.")
     p.add_argument("--acronym-cap", type=int, default=None,
                    help="Bucket cap for name_acronym alone. See src.blocking.")
     p.add_argument("--acronym-min-len", type=int, default=0,
@@ -1013,6 +1152,14 @@ def main() -> None:
     p.add_argument("--train-entities", type=int, default=500_000,
                    help="--scorer model only. Entities sampled per fold for "
                         "training. 0 uses all of them.")
+    p.add_argument("--train-rows", type=int, default=6_000_000,
+                   help="--scorer model only. Row budget per fold's training "
+                        "set, which caps --train-entities using the measured "
+                        "rows-per-entity of the feature table. The entity "
+                        "count controls memory only through that ratio, and "
+                        "it went from 10.9 to 56.4 when the LSH bands landed, "
+                        "so a default in entities does not survive a change to "
+                        "the candidate set. 0 disables. See src.model.")
     p.add_argument("--rounds", type=int, default=600,
                    help="--scorer model only. Boosting round ceiling; early "
                         "stopping on an inner slice usually stops first.")
@@ -1099,6 +1246,16 @@ def main() -> None:
     if a.scorer == "model" and a.blocking != "multi":
         p.error("--scorer model reads the candidate and normalized parquet "
                 "that only --blocking multi produces.")
+    if a.keys and a.bands is not None:
+        p.error("pass --keys or --bands, not both: --keys already names the "
+                "exact band subset to block on.")
+    # The single-key path normalizes in memory and never writes a band column,
+    # so --bands is silently inert there rather than wrong. Refuse it for the
+    # same reason --legacy-norm and --scorer model are refused above: a flag
+    # that appears to do something and does nothing is worse than an error.
+    if a.bands is not None and a.blocking != "multi":
+        p.error("--bands applies to --blocking multi only; the single-key "
+                "path builds no LSH signatures.")
 
     started = time.perf_counter()
     if a.legacy_norm:
@@ -1109,6 +1266,12 @@ def main() -> None:
     print(f"  normalization: {mode}")
     print(f"  blocking: {a.blocking}"
           + (f"  budget={a.budget}" if a.blocking == "multi" else ""))
+    if a.blocking == "multi" and not a.keys:
+        n_b = blocking.N_BANDS if a.bands is None else a.bands
+        print(f"  fuzzy: {n_b}/{blocking.N_BANDS} LSH bands"
+              + (f" (rows={minhash.DEFAULT_ROWS}, detects trigram J=0.5 at "
+                 f"{minhash.detection_rate(0.5, n_b, minhash.DEFAULT_ROWS):.0%})"
+                 if n_b else " — OFF, exact keys only"))
     print(f"  scorer: {a.scorer}"
           + (f"  folds={a.folds}  coverage={a.coverage:g}"
              if a.scorer == "model" else f"  threshold={a.threshold:g}"))
@@ -1133,28 +1296,29 @@ def main() -> None:
             cands, matches = generate_model(
                 a.split, data, work, a.topk, a.budget, a.max_bucket, a.chunk,
                 a.merge_buckets, keys, a.reuse_candidates, a.acronym_cap,
-                a.acronym_min_len, a.coverage, a.folds,
+                a.acronym_min_len, a.bands if keys is None else None,
+                a.band_min_hits, a.band_cap, a.max_pairs_per_key or None,
+                a.max_pairs_total or None, a.coverage, a.folds,
                 a.train_entities or None, a.rounds, a.seed,
+                a.train_rows or None,
             )
         else:
             cands, matches = generate_multi(
                 a.split, data, work, a.topk, a.threshold, a.budget,
                 a.max_bucket, a.chunk, a.merge_buckets, keys,
                 a.reuse_candidates, a.acronym_cap, a.acronym_min_len,
+                a.bands if keys is None else None, a.band_min_hits,
+                a.band_cap, a.max_pairs_per_key or None,
+                a.max_pairs_total or None,
+                char_ngram=a.char_ngram,
+                ngram_n=a.ngram_n,
+                ngram_max_bucket=a.ngram_max_bucket,
+                prefix=a.prefix,
+                prefix_len=a.prefix_len,
+                prefix_max_bucket=a.prefix_max_bucket,
+                tfidf=a.tfidf,
+                tfidf_top_k=a.tfidf_top_k,
             )
-        cands, matches = generate_multi(
-            a.split, data, work, a.topk, a.threshold, a.budget,
-            a.max_bucket, a.chunk, a.merge_buckets, keys,
-            a.reuse_candidates, a.acronym_cap, a.acronym_min_len,
-            char_ngram=a.char_ngram,
-            ngram_n=a.ngram_n,
-            ngram_max_bucket=a.ngram_max_bucket,
-            prefix=a.prefix,
-            prefix_len=a.prefix_len,
-            prefix_max_bucket=a.prefix_max_bucket,
-            tfidf=a.tfidf,
-            tfidf_top_k=a.tfidf_top_k,
-        )
     else:
         if a.normalize_only:
             p.error("--normalize-only applies to --blocking multi only.")

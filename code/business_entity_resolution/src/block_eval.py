@@ -143,7 +143,32 @@ def candidate_recall(
     # Entities blocking produced nothing for do not appear in `sizes` at all,
     # so they have to be counted by difference rather than filtered for.
     no_candidates = s1_total - sizes.height
-    under = int((sizes["n"] < budget).sum()) + no_candidates
+
+    # The cap is READ OFF THE FILE, not taken from the flag.
+    #
+    # `--budget` here defaulted to 20 and was used as the threshold whatever
+    # the file was actually built at, so evaluating a budget-60 file without
+    # repeating the flag printed "entities under budget (20): 66.39%" and
+    # labelled it "headroom a fuzzy stage could fill". Both halves are wrong:
+    # the threshold is not the file's cap, and being under it is not headroom.
+    # It invites "the budget is not binding", which is the session-4 failure
+    # verbatim, from a different direction.
+    #
+    # No entity can hold more candidates than the budget blocking ran at, so
+    # the largest per-entity count IS that budget (on any split with at least
+    # one saturated entity, which is every real run so far).
+    observed = int(sizes["n"].max()) if sizes.height else 0
+    at_cap = int((sizes["n"] == observed).sum()) if observed else 0
+    # What those entities are missing is the upper bound on everything a
+    # larger budget can recover — the number session 4 said should be read and
+    # that this function never actually computed.
+    capped_ids = sizes.filter(pl.col("n") == observed).select("source1_entity_id")
+    missed_at_cap = int(
+        per_entity.join(capped_ids, on="source1_entity_id", how="inner")
+        .select((pl.col("n_true") - pl.col("n_found")).sum())
+        .item() or 0
+    ) if observed else 0
+    under = int((sizes["n"] < observed).sum()) + no_candidates
 
     _section(f"candidate set [{split}] — {cand_path.name}")
     print(f"true pairs                  : {n_true:,}")
@@ -159,8 +184,19 @@ def candidate_recall(
     print(f"candidate pairs emitted     : {total_cand:,}")
     print(f"mean candidates per entity  : {total_cand / max(s1_total, 1):.2f}")
     print(f"entities with no candidates : {no_candidates:,}")
-    print(f"entities under budget ({budget})  : {under:,} "
-          f"({under / max(s1_total, 1):.2%})  <- headroom a fuzzy stage could fill")
+    if budget != observed:
+        print(f"  NOTE: --budget said {budget}, but this file's largest entity "
+              f"holds {observed}. Reporting against {observed}, which is what "
+              "blocking actually ran at.")
+    print(f"entities AT the cap ({observed})     : {at_cap:,} "
+          f"({at_cap / max(s1_total, 1):.2%})  <- only these can lose a true "
+          "match to the budget")
+    print(f"  true matches they are missing : {missed_at_cap:,} "
+          f"({missed_at_cap / max(n_true, 1):.2%} of all true pairs)  <- the "
+          "MOST a larger budget can recover")
+    print(f"entities below the cap      : {under:,} "
+          f"({under / max(s1_total, 1):.2%})  <- a larger budget cannot help "
+          "these; only more keys can")
     full_cross = s1_total * targets
     if full_cross:
         print(f"reduction ratio             : {1 - total_cand / full_cross:.8f} "
@@ -245,49 +281,107 @@ def budget_curve(
     truth = ground_truth_pairs(paths.ground_truth_tsv(data)).rename(
         {"matched_entity_id": "candidate_entity_id"}
     )
-    # Re-sort rather than trusting the file's row order. It happens to be
-    # written in per-entity score order, but relying on that silently couples
-    # this diagnostic to an implementation detail of the merge.
-    ranked = (
-        pl.read_parquet(cand_path)
-        .sort(
+
+    # Processed ONE MERGE BUCKET AT A TIME, and the reason is the same one the
+    # merge itself is bucketed for.
+    #
+    # This used to `pl.read_parquet` the whole candidate file eagerly and take
+    # a GLOBAL SORT over it. At four exact keys and budget 20 that is 23.6M
+    # rows and merely slow. With the LSH bands at budget 60 it is ~132M rows
+    # and a global sort of them, which is the "concatenating every partial and
+    # taking a global sort over ~100M rows wants 8-12GB" failure recorded in
+    # the journal -- fixed in `_merge` in session 3 and sitting here unnoticed
+    # ever since, in a diagnostic that runs on every single invocation.
+    #
+    # The sort is only ever needed per entity, and an entity's candidates are
+    # entirely inside one bucket by construction, so bucketing makes the
+    # ranking exact rather than approximate. Nothing is traded away.
+    #
+    # What accumulates across buckets is only the RANK OF EACH TRUE MATCH --
+    # about 4.9M rows of two columns at present -- not the candidate set.
+    cols = set(pl.scan_parquet(cand_path).collect_schema().names())
+    if "bucket" in cols:
+        bucket_ids = sorted(
+            pl.scan_parquet(cand_path).select("bucket").unique()
+            .collect().to_series().to_list()
+        )
+        def _read(b):
+            return pl.scan_parquet(cand_path).filter(pl.col("bucket") == b).collect()
+    else:
+        # A candidate file written before blocking recorded the column. Fall
+        # back to the old whole-file path rather than silently mis-ranking,
+        # but say so, because on a large file it is the expensive route.
+        print("  (candidate file predates the `bucket` column — reading it "
+              "whole, which needs several GB at this size)")
+        bucket_ids = [None]
+        def _read(_):
+            return pl.read_parquet(cand_path)
+
+    matched_parts = []
+    n_entities = 0
+    total_rows = 0
+    truth_eager = truth.collect()
+    for b in bucket_ids:
+        part = _read(b)
+        if part.is_empty():
+            continue
+        total_rows += part.height
+        n_entities += int(part["source1_entity_id"].n_unique())
+        ranked_b = part.sort(
             ["block_score", "n_keys", "candidate_entity_id"],
             descending=[True, True, False],
-        )
-        .with_columns(
+        ).with_columns(
             pl.int_range(pl.len()).over("source1_entity_id").alias("rank")
+        ).select("source1_entity_id", "candidate_entity_id", "rank")
+        matched_parts.append(
+            ranked_b.join(
+                truth_eager, on=["source1_entity_id", "candidate_entity_id"],
+                how="inner",
+            ).select("source1_entity_id", "rank")
         )
+        del part, ranked_b
+    matched = (
+        pl.concat(matched_parts, how="vertical") if matched_parts
+        else pl.DataFrame(schema={"source1_entity_id": pl.Utf8, "rank": pl.Int64})
     )
-    n_entities = int(ranked["source1_entity_id"].n_unique())
+    del matched_parts
+    # Denominator: every entity that has a true match, whether or not blocking
+    # found any of them. Taken from the ground truth rather than the candidate
+    # file, because an entity with zero candidates must count as zero recall
+    # and is absent from the candidate file entirely.
+    n_true_per_entity = (
+        truth_eager.group_by("source1_entity_id").len().rename({"len": "n_true"})
+    )
+
     _section("macro recall vs per-entity budget (same candidate file)")
     print(f"{'budget':>8} {'macro recall':>14} {'pair recall':>13} "
           f"{'candidates':>13} {'mean/entity':>12}")
     observed: list[tuple[int, float]] = []
+    n_true_total = int(n_true_per_entity["n_true"].sum())
+    # Per-entity candidate counts, once, so the "candidates" column at each cut
+    # is sum(min(count, k)) rather than the height of a materialized cut.
+    ent_sizes = (
+        pl.scan_parquet(cand_path).group_by("source1_entity_id").len()
+        .select(pl.col("len")).collect().to_series()
+    )
     for k in cuts:
-        cut = ranked.filter(pl.col("rank") < k)
-        per_entity = (
-            truth.join(
-                cut.lazy().select("source1_entity_id", "candidate_entity_id")
-                .with_columns(pl.lit(True).alias("found")),
-                on=["source1_entity_id", "candidate_entity_id"],
-                how="left",
-            )
-            .group_by("source1_entity_id")
-            .agg(
-                pl.len().alias("n_true"),
-                pl.col("found").fill_null(False).sum().alias("n_found"),
-            )
-            .collect()
+        found = (
+            matched.filter(pl.col("rank") < k)
+            .group_by("source1_entity_id").len().rename({"len": "n_found"})
         )
+        per_entity = n_true_per_entity.join(
+            found, on="source1_entity_id", how="left"
+        ).with_columns(pl.col("n_found").fill_null(0))
         if per_entity.is_empty():
             continue
-        macro = float(
-            (per_entity["n_found"] / per_entity["n_true"]).mean()
-        )
-        pair = int(per_entity["n_found"].sum()) / int(per_entity["n_true"].sum())
+        # Candidate count at this cut without materializing the cut: every
+        # entity contributes min(its own count, k).
+        n_cut = int(ent_sizes.clip(upper_bound=k).sum())
+        macro = float((per_entity["n_found"] / per_entity["n_true"]).mean())
+        pair = int(per_entity["n_found"].sum()) / max(n_true_total, 1)
         observed.append((k, macro))
-        print(f"{k:>8} {macro:>13.2%} {pair:>12.2%} {cut.height:>13,} "
-              f"{cut.height / max(n_entities, 1):>11.2f}")
+        print(f"{k:>8} {macro:>13.2%} {pair:>12.2%} {n_cut:>13,} "
+              f"{n_cut / max(n_entities, 1):>11.2f}")
 
     # Read the curve rather than printing advice for both cases and leaving the
     # reader to pick. The first version printed "still climbing -> raise the
@@ -309,9 +403,27 @@ def budget_curve(
 
 def key_diagnostics(
     split: str, work: Path, data: Path, max_bucket: int | None,
-    sample_pairs: int | None,
+    sample_pairs: int | None, acronym_cap: int | None = None,
+    band_cap: int | None = None,
 ) -> None:
-    caps = {k: (max_bucket or c) for k, _, c in blocking.KEY_SPECS}
+    # The caps must be the ones BLOCKING ran with, not the KEY_SPECS defaults.
+    # This function used to read the defaults only, so `--acronym-cap 500` (and
+    # later `--band-cap`) changed the candidate file while `usable`, `cap cost`
+    # and both UNION lines went on describing a run that never happened.
+    # Measured: a 40x sweep of --band-cap moved macro recall from 81.48% to
+    # 77.29% while `the bucket cap costs` sat at 1.25% for every point -- a
+    # number that cannot move is not a measurement, which is the session-4
+    # budget-curve lesson in a third place.
+    def _cap(key: str, default: int) -> int:
+        if max_bucket:
+            return max_bucket
+        if key == "name_acronym" and acronym_cap:
+            return acronym_cap
+        if blocking.is_band(key) and band_cap:
+            return band_cap
+        return default
+
+    caps = {k: _cap(k, c) for k, _, c in blocking.KEY_SPECS}
     keys = list(caps)
 
     _section("per-key diagnostics")
@@ -343,46 +455,82 @@ def key_diagnostics(
         return
     print(f"true pairs examined: {total:,}\n")
 
+    def _agrees(key: str) -> pl.Expr:
+        """Both sides present and equal.
+
+        The emptiness test is not cosmetic and is the same one `_usable`
+        makes: two records that both normalize to an empty name would
+        otherwise "agree" on every name key at once and be counted as reach
+        this stage does not have. For a band key the analogue is nullness — an
+        empty trigram list gives a null signature — and `str.len_chars()` on a
+        UInt64 raises rather than returning something wrong, which is how this
+        was found.
+        """
+        eq = (pl.col(key) == pl.col(f"{key}_r")) & pl.col(key).is_not_null()
+        if blocking.is_band(key):
+            return eq & pl.col(f"{key}_r").is_not_null()
+        return eq & (pl.col(key).str.len_chars() > 0)
+
     # Target-side bucket sizes, so a key that agrees can be told apart from one
     # that agrees AND would have survived the cap.
+    #
+    # Each key is reduced to TWO booleans and its inputs dropped before the
+    # next one is joined. That matters now in a way it did not at five keys:
+    # at twenty-one, holding every key's value for both sides plus every
+    # bucket size over 7.6M true pairs is several GB, and it would be spent at
+    # the end of a run that has already paid for blocking. The journal's
+    # "merge would have failed at the end of the longest job" entry is the same
+    # shape — peak memory in a step that runs last. Dropping as we go keeps
+    # this at 2 booleans per key regardless of how many keys there are.
     for key in keys:
         sizes = (
             others.select(blocking.blocking_key(key))
             .group_by("bk").len().collect()
         )
+        # Band signatures are UInt64 and `concat_str` will not take an integer
+        # column, so the right-hand value needs the same cast
+        # `blocking.blocking_key` applies on the left. Without it this joins
+        # nothing and every band reads as 0.00% usable — a diagnostic that
+        # fails silently in the direction of "the new keys do nothing", which
+        # is precisely the conclusion it would be used to draw.
+        value_r = pl.col(f"{key}_r")
+        if blocking.is_band(key):
+            value_r = value_r.cast(pl.Utf8)
         base = (
             base.with_columns(
                 pl.concat_str([
                     pl.col("country_norm_r").fill_null(""),
                     pl.lit("|"),
-                    pl.col(f"{key}_r"),
+                    value_r,
                 ]).alias("bk")
             )
             .join(sizes, on="bk", how="left")
             .rename({"len": f"_size_{key}"})
             .drop("bk")
+            .with_columns(_agrees(key).alias(f"_agree_{key}"))
+            .with_columns(
+                (
+                    pl.col(f"_agree_{key}")
+                    # A null size means the value was not in the target table
+                    # at all, which cannot happen for a pair whose right side
+                    # came from it — but fill defensively rather than letting a
+                    # null silently count as usable.
+                    & pl.col(f"_size_{key}").fill_null(10**9).le(caps[key])
+                ).alias(f"_usable_{key}")
+            )
+            # The two booleans are all that is read from here on, so the key's
+            # own columns and its bucket size go now rather than at the end.
+            .drop(f"_size_{key}", key, f"{key}_r")
         )
         del sizes
 
-    base = base.with_columns([
-        (
-            (pl.col(key) == pl.col(f"{key}_r"))
-            & pl.col(key).is_not_null()
-            & (pl.col(key).str.len_chars() > 0)
-        ).alias(f"_agree_{key}")
-        for key in keys
-    ])
-    base = base.with_columns([
-        (
-            pl.col(f"_agree_{key}")
-            # A null size means the value was not in the target table at all,
-            # which cannot happen for a pair whose right side came from it —
-            # but fill defensively rather than letting a null silently count
-            # as usable.
-            & pl.col(f"_size_{key}").fill_null(10**9).le(caps[key])
-        ).alias(f"_usable_{key}")
-        for key in keys
-    ])
+    def _any(cols: list[str]) -> int:
+        if not cols:
+            return 0
+        return int(base.select(pl.any_horizontal([pl.col(c) for c in cols]).sum()).item())
+
+    exact = [k for k in keys if not blocking.is_band(k)]
+    bands = [k for k in keys if blocking.is_band(k)]
 
     print(f"{'key':<14} {'agrees':>9} {'usable':>9} {'cap cost':>9} {'unique':>9}")
     for key in keys:
@@ -396,19 +544,45 @@ def key_diagnostics(
         )
         print(f"{key:<14} {agree / total:>8.2%} {usable / total:>8.2%} "
               f"{(agree - usable) / total:>8.2%} {unique / total:>8.2%}")
+        # A per-band "unique" is nearly always ~0 and says nothing: the bands
+        # are deliberately redundant with EACH OTHER, since a similar pair is
+        # meant to agree on several. The number that matters is what the bands
+        # add as a GROUP, printed below. Without this note the sixteen zeroes
+        # read as "the bands contribute nothing", which is the same misreading
+        # the budget curve's guaranteed-flat rows produced in session 4.
 
-    union = int(base.select(
-        pl.any_horizontal([pl.col(f"_usable_{k}") for k in keys]).sum()
-    ).item())
-    uncapped = int(base.select(
-        pl.any_horizontal([pl.col(f"_agree_{k}") for k in keys]).sum()
-    ).item())
+    union = _any([f"_usable_{k}" for k in keys])
+    uncapped = _any([f"_agree_{k}" for k in keys])
+    ex_union = _any([f"_usable_{k}" for k in exact])
+    bd_union = _any([f"_usable_{k}" for k in bands])
+    # What each group reaches that the OTHER group does not. This is the pair
+    # of numbers the fuzzy stage lives or dies by, and neither is visible in
+    # the per-key table above.
+    ex_only = int(base.select((
+        pl.any_horizontal([pl.col(f"_usable_{k}") for k in exact])
+        & ~pl.any_horizontal([pl.col(f"_usable_{k}") for k in bands])
+    ).sum()).item()) if exact and bands else 0
+    bd_only = int(base.select((
+        pl.any_horizontal([pl.col(f"_usable_{k}") for k in bands])
+        & ~pl.any_horizontal([pl.col(f"_usable_{k}") for k in exact])
+    ).sum()).item()) if exact and bands else 0
+
     print(f"\nUNION (what stage A can reach) : {union / total:.2%}")
     print(f"UNION if buckets were unlimited: {uncapped / total:.2%}")
     print(f"  -> the bucket cap costs        {(uncapped - union) / total:.2%} "
           "of all true pairs")
-    print(f"UNREACHABLE by any exact key   : {1 - uncapped / total:.2%} "
-          "<- needs fuzzy matching; no rule, weight or cap change touches it")
+    if bands:
+        print(f"\n  exact keys alone    : {ex_union / total:>7.2%}   "
+              "<- the ceiling every number in findings.md was measured against")
+        print(f"  LSH bands alone     : {bd_union / total:>7.2%}")
+        print(f"  bands add uniquely  : {bd_only / total:>7.2%}   "
+              "<- true pairs NO exact key reaches at any cap")
+        print(f"  exact adds uniquely : {ex_only / total:>7.2%}   "
+              "<- why the exact keys stay")
+        print(f"\nUNREACHABLE by ANY key         : {1 - uncapped / total:.2%}")
+    else:
+        print(f"UNREACHABLE by any exact key   : {1 - uncapped / total:.2%} "
+              "<- needs fuzzy matching; run without --bands 0")
 
 
 def main() -> None:
@@ -418,6 +592,17 @@ def main() -> None:
     p.add_argument("--data-root", default=None)
     p.add_argument("--budget", type=int, default=20,
                    help="Budget blocking was run with, for the shortfall count.")
+    p.add_argument(
+        "--acronym-cap", type=int, default=None,
+        help="The --acronym-cap BLOCKING was run with. The per-key table is "
+        "recomputed from the normalized parquet, so it has no way to know "
+        "which caps produced the candidate file and will describe the "
+        "defaults unless told.",
+    )
+    p.add_argument(
+        "--band-cap", type=int, default=None,
+        help="The --band-cap BLOCKING was run with. See --acronym-cap.",
+    )
     p.add_argument("--max-bucket", type=int, default=None,
                    help="Global cap override for the diagnostics. Leave unset "
                         "to use each key's own cap from KEY_SPECS.")
@@ -468,7 +653,8 @@ def main() -> None:
             budget_curve(a.split, work, data, cand_path, cuts)
 
     if not a.no_key_diagnostics:
-        key_diagnostics(a.split, work, data, a.max_bucket, a.sample_pairs)
+        key_diagnostics(a.split, work, data, a.max_bucket, a.sample_pairs,
+                    a.acronym_cap, a.band_cap)
 
 
 if __name__ == "__main__":
