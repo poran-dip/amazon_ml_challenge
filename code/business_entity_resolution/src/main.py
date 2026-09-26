@@ -571,6 +571,15 @@ def _jaccard(a: pl.Expr, b: pl.Expr) -> pl.Expr:
         pl.when(union == 0).then(0.0).otherwise(inter / union).cast(pl.Float32)
     )
 
+# --------------------------------------------------------------------------
+# additional blocking functions (imported from blocking.py)
+# --------------------------------------------------------------------------
+from .blocking import (  # noqa: F401
+    character_ngram_blocking,
+    prefix_blocking,
+    tfidf_retrieval_blocking,
+)
+
 
 def generate(
     split: str, data: Path, sample: int | None, sample_targets: int | None,
@@ -615,10 +624,27 @@ def generate(
 
 
 def generate_multi(
-    split: str, data: Path, work: Path, topk: int, threshold: float,
-    budget: int, max_bucket: int | None, chunk: int, merge_buckets: int,
-    keys: tuple[str, ...] | None, reuse_candidates: bool = False,
-    acronym_cap: int | None = None, acronym_min_len: int = 0,
+    split: str,
+    data: Path,
+    work: Path,
+    topk: int,
+    threshold: float,
+    budget: int,
+    max_bucket: int | None,
+    chunk: int,
+    merge_buckets: int,
+    keys: tuple[str, ...] | None,
+    reuse_candidates: bool = False,
+    acronym_cap: int | None = None,
+    acronym_min_len: int = 0,
+    char_ngram: bool = False,
+    ngram_n: int = 5,
+    ngram_max_bucket: int = 200,
+    prefix: bool = False,
+    prefix_len: int = 3,
+    prefix_max_bucket: int = 500,
+    tfidf: bool = False,
+    tfidf_top_k: int = 20,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Multi-key blocking, then the same address score and top-k as before.
 
@@ -650,6 +676,14 @@ def generate_multi(
         cand_path = blocking.block_split(
             split, work, budget, max_bucket, chunk, merge_buckets, keys,
             acronym_cap, acronym_min_len,
+            char_ngram=char_ngram,
+            ngram_n=ngram_n,
+            ngram_max_bucket=ngram_max_bucket,
+            prefix=prefix,
+            prefix_len=prefix_len,
+            prefix_max_bucket=prefix_max_bucket,
+            tfidf=tfidf,
+            tfidf_top_k=tfidf_top_k,
         )
 
     # Address lookups, resident. Two narrow frames — IDs and one short string —
@@ -983,6 +1017,45 @@ def main() -> None:
                    help="--scorer model only. Boosting round ceiling; early "
                         "stopping on an inner slice usually stops first.")
     p.add_argument("--seed", type=int, default=13)
+    p.add_argument(
+    "--char-ngram",
+    action="store_true",
+    help="Enable character n-gram blocking.",)
+    p.add_argument(
+    "--ngram-n",
+    type=int,
+    default=5,
+    help="Character n-gram length (default: 5).",)
+    p.add_argument(
+    "--ngram-max-bucket",
+    type=int,
+    default=200,
+    help="Maximum target bucket size for character n-grams (default: 200).",)
+
+    p.add_argument(
+    "--prefix",
+    action="store_true",
+    help="Enable prefix blocking.",)
+    p.add_argument(
+    "--prefix-len",
+    type=int,
+    default=3,
+    help="Prefix length (default: 3).",)
+    p.add_argument(
+    "--prefix-max-bucket",
+    type=int,
+    default=500,
+    help="Maximum target bucket size for prefixes (default: 500).",)
+
+    p.add_argument(
+    "--tfidf",
+    action="store_true",
+    help="Enable sparse TF-IDF retrieval blocking.",)
+    p.add_argument(
+    "--tfidf-top-k",
+    type=int,
+    default=20,
+    help="Number of TF-IDF candidates per Source-1 entity (default: 20).",)
     p.add_argument("--force-normalize", action="store_true",
                    help="Rebuild the normalized parquet even if it looks "
                         "current. The cache is invalidated automatically when "
@@ -1069,6 +1142,19 @@ def main() -> None:
                 a.max_bucket, a.chunk, a.merge_buckets, keys,
                 a.reuse_candidates, a.acronym_cap, a.acronym_min_len,
             )
+        cands, matches = generate_multi(
+            a.split, data, work, a.topk, a.threshold, a.budget,
+            a.max_bucket, a.chunk, a.merge_buckets, keys,
+            a.reuse_candidates, a.acronym_cap, a.acronym_min_len,
+            char_ngram=a.char_ngram,
+            ngram_n=a.ngram_n,
+            ngram_max_bucket=a.ngram_max_bucket,
+            prefix=a.prefix,
+            prefix_len=a.prefix_len,
+            prefix_max_bucket=a.prefix_max_bucket,
+            tfidf=a.tfidf,
+            tfidf_top_k=a.tfidf_top_k,
+        )
     else:
         if a.normalize_only:
             p.error("--normalize-only applies to --blocking multi only.")
