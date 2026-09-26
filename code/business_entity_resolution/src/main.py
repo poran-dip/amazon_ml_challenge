@@ -682,13 +682,32 @@ def generate(
     return cands, matches
 
 
+def _has_bucket_col(cand_path: Path) -> bool:
+    """Whether the candidate parquet carries blocking's `bucket` column.
+
+    Cached because it is called inside the per-bucket loop and a schema read
+    is a file open. Keyed on the path AND its mtime, so re-running blocking
+    inside one process does not serve a stale answer.
+    """
+    key = (str(cand_path), cand_path.stat().st_mtime_ns)
+    hit = _BUCKET_COL_CACHE.get(key)
+    if hit is None:
+        hit = "bucket" in pl.scan_parquet(cand_path).collect_schema().names()
+        _BUCKET_COL_CACHE[key] = hit
+    return hit
+
+
+_BUCKET_COL_CACHE: dict[tuple[str, int], bool] = {}
+
+
 def generate_multi(
     split: str, data: Path, work: Path, topk: int, threshold: float,
     budget: int, max_bucket: int | None, chunk: int, merge_buckets: int,
     keys: tuple[str, ...] | None, reuse_candidates: bool = False,
     acronym_cap: int | None = None, acronym_min_len: int = 0,
     bands: int | None = None, band_min_hits: int = 1,
-    band_cap: int | None = None,
+    band_cap: int | None = None, max_pairs: int | None = None,
+    max_total: int | None = None,
     char_ngram: bool = False,
     ngram_n: int = 5,
     ngram_max_bucket: int = 200,
@@ -728,6 +747,7 @@ def generate_multi(
         cand_path = blocking.block_split(
             split, work, budget, max_bucket, chunk, merge_buckets, keys,
             acronym_cap, acronym_min_len, bands, band_min_hits, band_cap,
+            max_pairs, max_total,
             char_ngram=char_ngram,
             ngram_n=ngram_n,
             ngram_max_bucket=ngram_max_bucket,
@@ -763,9 +783,16 @@ def generate_multi(
     # isolation. This keeps the join output bounded instead of materializing
     # ~44M scored pairs at once.
     for b in range(merge_buckets):
+        # Same fix as `features.build_features`: filter on the materialized
+        # `bucket` column when blocking wrote one, so parquet row-group
+        # statistics skip the rest of the file instead of this decoding the
+        # whole candidate set once per bucket.
         chunk_df = (
             pl.scan_parquet(cand_path)
-            .filter((pl.col("source1_entity_id").hash() % merge_buckets) == b)
+            .filter(
+                (pl.col("bucket") == b) if _has_bucket_col(cand_path)
+                else ((pl.col("source1_entity_id").hash() % merge_buckets) == b)
+            )
             .collect()
         )
         if chunk_df.is_empty():
@@ -806,7 +833,8 @@ def generate_model(
     max_bucket: int | None, chunk: int, merge_buckets: int,
     keys: tuple[str, ...] | None, reuse_candidates: bool,
     acronym_cap: int | None, acronym_min_len: int, bands: int | None,
-    band_min_hits: int, band_cap: int | None, coverage: float, folds: int, train_entities: int | None,
+    band_min_hits: int, band_cap: int | None, max_pairs: int | None,
+    max_total: int | None, coverage: float, folds: int, train_entities: int | None,
     rounds: int, seed: int,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Multi-key blocking, then features, then the learned scorer.
@@ -835,6 +863,7 @@ def generate_model(
         blocking.block_split(
             split, work, budget, max_bucket, chunk, merge_buckets, keys,
             acronym_cap, acronym_min_len, bands, band_min_hits, band_cap,
+            max_pairs, max_total,
         )
 
     print("  features:")
@@ -1046,6 +1075,18 @@ def main() -> None:
                         "reference run this change has to be measured "
                         "against. Bands are nested, so a curve over this needs "
                         "no re-normalization. See src.minhash.")
+    p.add_argument("--max-pairs-total", type=int, default=1_500_000_000,
+                   help="Refuse a key set projected to emit more than this "
+                        "many raw pairs in total. THE guard that matters: at "
+                        "--band-cap 1000 each band projects ~212M, under any "
+                        "sane per-key limit, while sixteen come to 3.4 "
+                        "billion. 0 disables. See src.blocking.")
+    p.add_argument("--max-pairs-per-key", type=int, default=400_000_000,
+                   help="Refuse to emit a blocking key projected to produce "
+                        "more than this many raw pairs. The projection is "
+                        "exact and costs a one-row aggregation, so an "
+                        "oversized configuration fails in seconds rather than "
+                        "an hour in. 0 disables. See src.blocking.")
     p.add_argument("--band-cap", type=int, default=None,
                    help="Bucket cap for every LSH band. The fan-out knob: "
                         "pairs per entity per band is the SIZE-BIASED mean "
@@ -1221,7 +1262,8 @@ def main() -> None:
                 a.split, data, work, a.topk, a.budget, a.max_bucket, a.chunk,
                 a.merge_buckets, keys, a.reuse_candidates, a.acronym_cap,
                 a.acronym_min_len, a.bands if keys is None else None,
-                a.band_min_hits, a.band_cap, a.coverage, a.folds,
+                a.band_min_hits, a.band_cap, a.max_pairs_per_key or None,
+                a.max_pairs_total or None, a.coverage, a.folds,
                 a.train_entities or None, a.rounds, a.seed,
             )
         else:
@@ -1230,7 +1272,8 @@ def main() -> None:
                 a.max_bucket, a.chunk, a.merge_buckets, keys,
                 a.reuse_candidates, a.acronym_cap, a.acronym_min_len,
                 a.bands if keys is None else None, a.band_min_hits,
-                a.band_cap,
+                a.band_cap, a.max_pairs_per_key or None,
+                a.max_pairs_total or None,
                 char_ngram=a.char_ngram,
                 ngram_n=a.ngram_n,
                 ngram_max_bucket=a.ngram_max_bucket,

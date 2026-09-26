@@ -481,6 +481,13 @@ def build_features(
         )
         print(f"  ground truth: {truth.height:,} true pairs")
 
+    cand_cols = set(pl.scan_parquet(cand_path).collect_schema().names())
+    has_bucket = "bucket" in cand_cols
+    if not has_bucket:
+        print("    candidate file predates the `bucket` column — falling back "
+              "to a recomputed hash, which re-reads it once per bucket. "
+              "Re-run src.blocking to avoid that.")
+
     dst = paths.features_parquet(split, work)
     import pyarrow.parquet as pq
 
@@ -489,11 +496,25 @@ def build_features(
     positives = 0
     try:
         for b in range(merge_buckets):
+            # Filter on the materialized `bucket` column that blocking now
+            # writes, NOT on a recomputed hash. The hash version forced a full
+            # read and decode of the candidate file on every one of the
+            # merge_buckets iterations, because parquet cannot push down a
+            # predicate over a computed expression. `bucket` is a real column
+            # written in bucket order, so row-group statistics skip the rest.
+            #
+            # Falls back to the hash for a candidate file written before that
+            # column existed, which --reuse-candidates will happily hand over.
             chunk = (
                 pl.scan_parquet(cand_path)
-                .filter((pl.col("source1_entity_id").hash() % merge_buckets) == b)
+                .filter(
+                    (pl.col("bucket") == b) if has_bucket
+                    else ((pl.col("source1_entity_id").hash() % merge_buckets) == b)
+                )
                 .collect()
             )
+            if has_bucket and not chunk.is_empty():
+                chunk = chunk.drop("bucket")
             if chunk.is_empty():
                 continue
             # Inner joins on both sides. A candidate whose attributes are

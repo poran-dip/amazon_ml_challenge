@@ -327,8 +327,11 @@ def _usable(key: str, min_len: int = 0) -> pl.Expr:
 
 def _target_table(
     split: str, work: Path, key: str, cap: int, min_len: int = 0
-) -> pl.DataFrame:
+) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Source-2/3 side of one key, with over-large buckets removed.
+
+    Returns (rows, bucket census). The census is what lets the caller predict
+    this key's exact output size before emitting a single row.
 
     `bucket_size` is carried through rather than discarded: it becomes the
     inverse-frequency term in the score, so a match in a bucket of 2 outranks
@@ -353,19 +356,66 @@ def _target_table(
     sizes = sources.group_by("bk").len().collect()
     n_buckets = sizes.height
     n_dropped = int(sizes.filter(pl.col("len") > cap).height)
+    keep_sizes = sizes.filter(pl.col("len") <= cap).with_columns(
+        pl.col("len").cast(pl.UInt32).alias("bucket_size")
+    ).select("bk", "bucket_size")
     del sizes
 
-    kept = (
-        sources.with_columns(pl.len().over("bk").cast(pl.UInt32).alias("bucket_size"))
-        .filter(pl.col("bucket_size") <= cap)
-        .collect()
-    )
+    # Joined against the census rather than recomputed with `pl.len().over("bk")`.
+    # The window would rebuild, over 10.3M rows and ~5.5M groups, exactly the
+    # counts that were just collected one line above — and it runs once per
+    # key, so at twenty-one keys it is twenty-one redundant groupings of the
+    # whole target side. An inner join also applies the cap for free, since
+    # over-cap buckets are already absent from `keep_sizes`.
+    kept = sources.join(keep_sizes.lazy(), on="bk", how="inner").collect()
     note = f" (min len {min_len})" if min_len > 1 else ""
     print(
         f"    {key:<14} targets {kept.height:>12,} rows{note}   "
         f"{n_dropped:,}/{n_buckets:,} buckets over cap {cap:,} dropped"
     )
-    return kept
+    return kept, keep_sizes
+
+
+def _s1_for_key(s1_all: pl.DataFrame, key: str, min_len: int) -> pl.DataFrame:
+    """Source-1 side of one key, from the frame loaded once by the caller.
+
+    This used to re-read the normalized parquet inside every `_emit_key` call.
+    At four keys that was a rounding error; at twenty-one it is twenty-one
+    reads of source 1 to produce twenty-one two-column views of data that was
+    already in memory.
+    """
+    return (
+        s1_all.lazy()
+        .filter(_usable(key, min_len))
+        .select(pl.col("entity_id").alias("source1_entity_id"), blocking_key(key))
+        .collect()
+    )
+
+
+def projected_pairs(s1: pl.DataFrame, census: pl.DataFrame) -> int:
+    """EXACTLY how many raw pairs this key will emit, before emitting any.
+
+    Every source-1 row joins exactly one bucket, so its contribution is that
+    bucket's size, and the total is a sum over the census. This is a
+    one-row aggregation over two small frames, not a rehearsal of the join.
+
+    It exists because the alternative is finding out forty minutes in. The
+    first sixteen-band run emitted ~212M raw pairs PER BAND -- 3.4 billion in
+    total against 210M for all the exact keys -- and the only way that became
+    visible was watching the partials accumulate. The information needed to
+    predict it was fully determined before the first row was written.
+    """
+    if s1.is_empty() or census.is_empty():
+        return 0
+    counts = s1.group_by("bk").len().rename({"len": "n_s1"})
+    return int(
+        counts.join(census, on="bk", how="inner")
+        .select(
+            (pl.col("n_s1").cast(pl.Int64) * pl.col("bucket_size").cast(pl.Int64))
+            .sum()
+        )
+        .item() or 0
+    )
 
 
 def _emit_key(
@@ -375,77 +425,126 @@ def _emit_key(
     weight: float,
     cap: int,
     chunk: int,
+    s1_all: pl.DataFrame,
+    n_buckets: int,
     min_len: int = 0,
-) -> Path | None:
+    max_pairs: int | None = None,
+    running: list[int] | None = None,
+    max_total: int | None = None,
+) -> list[Path]:
     """Join source 1 against one key's target table, spill the hits to parquet.
 
-    Returns the partial's path, or None if the key produced no candidates at
-    all — which is normal for a key whose buckets all exceed the cap on a small
-    input, and must not crash the merge.
+    Returns one partial path per merge bucket that received rows -- possibly
+    empty, which is normal for a key whose buckets all exceed the cap on a
+    small input and must not crash the merge.
+
+    Output is PARTITIONED BY MERGE BUCKET as it is written. The merge consumes
+    one bucket at a time, and reading an unpartitioned partial back per bucket
+    means re-reading and re-filtering the whole file `n_buckets` times, on a
+    computed hash that parquet statistics cannot skip row groups for. Writing
+    to the right file in the first place costs nothing here and turns the
+    merge's read volume from 16x into 1x.
+
+    Bucket slices double as the chunking the old `--chunk` loop provided: at
+    16 buckets, source 1 arrives in slices of ~138k rows.
     """
     import pyarrow.parquet as pq
 
-    targets = _target_table(split, work, key, cap, min_len)
+    targets, census = _target_table(split, work, key, cap, min_len)
+    s1 = _s1_for_key(s1_all, key, min_len)
 
-    # Source 1, narrow and materialized once. Slicing a DataFrame is a
-    # zero-copy view, so the chunk loop below is a real cursor. Repeatedly
-    # calling `.slice(offset, chunk).collect()` on a LazyFrame is not — each
-    # collect re-reads from the start and discards everything before the
-    # offset, which at 250k chunks over a 10M-row source is 42 full passes.
-    s1 = (
-        pl.scan_parquet(paths.normalized_parquet(split, 1, work))
-        .select("entity_id", "country_norm", key)
-        .filter(_usable(key, min_len))
-        .select(pl.col("entity_id").alias("source1_entity_id"), blocking_key(key))
-        .collect()
+    projected = projected_pairs(s1, census)
+    total = (running[0] if running else 0) + projected
+    advice = (
+        "\n  Nothing more has been written. Lower --band-cap (fan-out is the "
+        "SIZE-BIASED mean bucket size, so halving the cap roughly halves "
+        "this), cut --bands, drop a key with --keys, or raise the limit if "
+        "you have the disk and the time."
     )
+    if max_pairs is not None and projected > max_pairs:
+        raise RuntimeError(
+            f"{key} alone would emit {projected:,} raw pairs, over "
+            f"--max-pairs-per-key ({max_pairs:,})." + advice
+        )
+    # The TOTAL matters independently, and a per-key limit cannot see it.
+    # At --band-cap 1000 every band projects ~212M, comfortably under any
+    # sane per-key limit, while sixteen of them come to 3.4 BILLION. The
+    # configuration that actually broke would have passed a per-key check.
+    if max_total is not None and total > max_total:
+        raise RuntimeError(
+            f"the selected keys would emit {total:,} raw pairs in total "
+            f"(reached while planning {key}, which adds {projected:,}), over "
+            f"--max-pairs-total ({max_total:,})." + advice
+        )
+    if running is not None:
+        running[0] = total
 
-    dst = paths.partial_parquet(split, key, work)
-    writer = None
+    written: list[Path] = []
     emitted = 0
-    try:
-        for offset in range(0, max(s1.height, 1), chunk):
-            block = s1.slice(offset, chunk)
-            if block.is_empty():
-                continue
-            hits = block.join(targets, on="bk", how="inner").select(
-                pl.col("source1_entity_id"),
-                pl.col("candidate_entity_id"),
-                # Inverse-frequency weighting. Sharing a name with one other
-                # record is strong evidence; sharing it with 2000 is nearly
-                # none. Without this the budget cap cannot tell tied candidates
-                # apart and evicts true matches effectively alphabetically —
-                # worth 2.4 points of macro recall at an IDENTICAL candidate
-                # count, which is pure re-ranking.
-                #
-                # bucket_size is at least 1, so the log argument is at least 2
-                # and the divisor is at least 1. A singleton bucket scores the
-                # full weight; nothing can divide by zero.
-                (
-                    pl.lit(weight, dtype=pl.Float32)
-                    / (pl.col("bucket_size").cast(pl.Float32) + 1.0).log(2.0)
-                ).alias("w"),
-                # Provenance. Constant within this key's partial, and OR-ed
-                # together across keys by the merge.
-                pl.lit(KEY_BITS[key], dtype=KEY_MASK_DTYPE).alias("key_bit"),
-            )
-            if hits.is_empty():
-                continue
-            table = hits.to_arrow()
-            if writer is None:
-                writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
-            writer.write_table(table)
-            emitted += hits.height
-    finally:
-        if writer is not None:
-            writer.close()
+    # One writer open at a time. The alternative -- a writer per bucket held
+    # open across one pass of source 1 -- would mean n_keys * n_buckets open
+    # parquet writers and their buffers.
+    bucket_of = (pl.col("source1_entity_id").hash() % n_buckets).alias("_b")
+    s1 = s1.with_columns(bucket_of)
+    for b in range(n_buckets):
+        block = s1.filter(pl.col("_b") == b).drop("_b")
+        if block.is_empty():
+            continue
+        dst = paths.partial_parquet(split, key, work, b)
+        writer = None
+        try:
+            for offset in range(0, block.height, chunk):
+                piece = block.slice(offset, chunk)
+                if piece.is_empty():
+                    continue
+                hits = piece.join(targets, on="bk", how="inner").select(
+                    pl.col("source1_entity_id"),
+                    pl.col("candidate_entity_id"),
+                    # Inverse-frequency weighting. Sharing a name with one
+                    # other record is strong evidence; sharing it with 2000 is
+                    # nearly none. Without this the budget cap cannot tell tied
+                    # candidates apart and evicts true matches effectively
+                    # alphabetically -- worth 2.4 points of macro recall at an
+                    # IDENTICAL candidate count, which is pure re-ranking.
+                    #
+                    # bucket_size is at least 1, so the log argument is at
+                    # least 2 and the divisor is at least 1. A singleton bucket
+                    # scores the full weight; nothing can divide by zero.
+                    (
+                        pl.lit(weight, dtype=pl.Float32)
+                        / (pl.col("bucket_size").cast(pl.Float32) + 1.0).log(2.0)
+                    ).alias("w"),
+                    # Provenance. Constant within this key's partial, and OR-ed
+                    # together across keys by the merge.
+                    pl.lit(KEY_BITS[key], dtype=KEY_MASK_DTYPE).alias("key_bit"),
+                )
+                if hits.is_empty():
+                    continue
+                table = hits.to_arrow()
+                if writer is None:
+                    writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
+                writer.write_table(table)
+                emitted += hits.height
+        finally:
+            if writer is not None:
+                writer.close()
+                written.append(dst)
 
     del targets, s1
-    if writer is None:
+    if not written:
         print(f"    {key:<14} no candidates emitted")
-        return None
-    print(f"    {key:<14} {emitted:>12,} raw pairs -> {dst.name}")
-    return dst
+        return []
+    # The projection is exact, so a mismatch means the join did something the
+    # census did not describe -- worth failing on rather than noting.
+    if emitted != projected:
+        raise RuntimeError(
+            f"{key}: projected {projected:,} raw pairs but emitted "
+            f"{emitted:,}. The bucket census and the join disagree, which "
+            "means one of them is not seeing the rows the other is."
+        )
+    print(f"    {key:<14} {emitted:>12,} raw pairs -> {len(written)} bucket "
+          f"files   (running total {total:,})")
+    return written
 
 
 # --------------------------------------------------------------------------
@@ -453,8 +552,8 @@ def _emit_key(
 # --------------------------------------------------------------------------
 
 def _merge(
-    partials: list[Path], dst: Path, budget: int, n_buckets: int,
-    band_min_hits: int = 1,
+    partials_by_bucket: dict[int, list[Path]], dst: Path, budget: int,
+    n_buckets: int, band_min_hits: int = 1,
 ) -> tuple[int, int]:
     """Combine every key's hits, score, and keep the best `budget` per entity.
 
@@ -469,12 +568,15 @@ def _merge(
     kept = 0
     raw = 0
     for b in range(n_buckets):
-        scans = [
-            pl.scan_parquet(p).filter(
-                (pl.col("source1_entity_id").hash() % n_buckets) == b
-            )
-            for p in partials
-        ]
+        here = partials_by_bucket.get(b, [])
+        if not here:
+            continue
+        # No filter. `_emit_key` already routed every row to its bucket's own
+        # file, so this reads exactly the rows it needs and reads them once.
+        # The previous version scanned EVERY partial on every iteration with a
+        # `hash % n == b` predicate, which parquet cannot push down because the
+        # hash is computed — 16 full passes over every partial per run.
+        scans = [pl.scan_parquet(p) for p in here]
         grouped = (
             pl.concat(scans, how="vertical")
             .group_by("source1_entity_id", "candidate_entity_id")
@@ -540,7 +642,16 @@ def _merge(
         # is already carried, and `features.py` reconstructs the band count by
         # summing its own `hit_band_*` flags. Writing them would add 2 bytes to
         # every one of ~47M rows to store something already present.
-        ).drop("n_bands", "n_exact")
+        ).drop("n_bands", "n_exact").with_columns(
+            # Materialized rather than recomputed downstream. `features.py` and
+            # the scoring pass both walk this file one bucket at a time with
+            # the same `hash % n == b` predicate, which parquet cannot push
+            # down because it is computed. As a real column, written in bucket
+            # order, its row-group statistics let the reader skip everything
+            # else. One byte per row that compresses to nothing, against
+            # re-reading the whole file n_buckets times.
+            pl.lit(b, dtype=pl.UInt16).alias("bucket")
+        )
         table = capped.to_arrow()
         if writer is None:
             writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
@@ -831,6 +942,8 @@ def block_split(
     bands: int | None = None,
     band_min_hits: int = 1,
     band_cap: int | None = None,
+    max_pairs: int | None = None,
+    max_total: int | None = None,
     char_ngram: bool = False,
     ngram_n: int = 5,
     ngram_max_bucket: int = 200,
@@ -853,7 +966,20 @@ def block_split(
         )
     selected = keys if keys is not None else default_keys(bands)
     specs = [s for s in KEY_SPECS if s[0] in selected]
-    if not specs and not (char_ngram or prefix or tfidf):
+    # The #7 emitters (`_emit_ngram`, `_emit_prefix`, `_emit_tfidf`) each
+    # write ONE unbucketed partial with no `key_bit` column. The merge now reads
+    # bucket-partitioned partials and aggregates `key_bit` into `key_mask`, so
+    # their output cannot be merged as written. (It could not on `main` either:
+    # `_merge` there also aggregated `key_bit`, which those partials lack.)
+    # Refused up front rather than failing after the exact keys have run. The
+    # code is kept so it can be ported — see `claude/next-steps.md`, Phase 1.
+    if char_ngram or prefix or tfidf:
+        raise NotImplementedError(
+            "--char-ngram / --prefix / --tfidf are not ported to the "
+            "bucket-partitioned merge: their partials need a `bucket` split and "
+            "a `key_bit`. Use the LSH bands (--bands) for fuzzy recall."
+        )
+    if not specs:
         raise ValueError(f"no keys selected; available: {list(KEY_COLUMNS)}")
     unknown = set(selected) - set(KEY_COLUMNS)
     if unknown:
@@ -895,7 +1021,33 @@ def block_split(
         )
 
     started = time.perf_counter()
-    partials: list[Path] = []
+
+    # Stale partials from an earlier run are deleted before anything is
+    # written. The merge now globs by bucket rather than taking a list of
+    # files it just created, so a leftover from a run with different keys,
+    # a different cap or a different --merge-buckets would be folded into
+    # this run's candidate set silently. Same failure family as the
+    # normalization cache in session 3, on a different artefact.
+    import glob as _glob
+    stale = _glob.glob(paths.partial_glob(split, work))
+    for f in stale:
+        Path(f).unlink()
+    if stale:
+        print(f"  removed {len(stale)} stale partial(s) from a previous run")
+
+    # Source 1 read ONCE, with every selected key column, instead of once per
+    # key inside _emit_key. Two columns of 2.2M rows per key is cheap; twenty-
+    # one reads of the parquet to get them is not.
+    s1_all = (
+        pl.scan_parquet(paths.normalized_parquet(split, 1, work))
+        .select("entity_id", "country_norm", *selected)
+        .collect()
+    )
+    print(f"  source1: {s1_all.height:,} rows resident "
+          f"({s1_all.estimated_size('mb'):.0f} MB)")
+
+    partials_by_bucket: dict[int, list[Path]] = {}
+    running = [0]
     for key, weight, cap in specs:
         if key == "name_acronym":
             cap = acronym_cap or cap
@@ -905,26 +1057,22 @@ def block_split(
             min_len = 0
         else:
             min_len = 0
-        partials.append(
-            _emit_key(split, work, key, weight, max_bucket or cap, chunk, min_len)
-        )
-
-    if char_ngram:
-        partials.append(_emit_ngram(split, work, n=ngram_n, max_bucket=ngram_max_bucket, chunk=chunk))
-    if prefix:
-        partials.append(_emit_prefix(split, work, prefix_len=prefix_len, max_bucket=prefix_max_bucket, chunk=chunk))
-    if tfidf:
-        partials.append(_emit_tfidf(split, work, top_k=tfidf_top_k))
-
-    partials = [p for p in partials if p is not None]
-    if not partials:
+        for path in _emit_key(
+            split, work, key, weight, max_bucket or cap, chunk, s1_all,
+            merge_buckets, min_len, max_pairs, running, max_total,
+        ):
+            b = int(path.stem.rsplit("_b", 1)[1])
+            partials_by_bucket.setdefault(b, []).append(path)
+    del s1_all
+    if not partials_by_bucket:
         raise RuntimeError(
             "every key produced zero candidates — check the normalized parquet."
         )
 
     dst = paths.candidates_parquet(split, work)
     print("  merging:")
-    raw, kept = _merge(partials, dst, budget, merge_buckets, band_min_hits)
+    raw, kept = _merge(partials_by_bucket, dst, budget, merge_buckets,
+                       band_min_hits)
     elapsed = time.perf_counter() - started
     gate = f" and >={band_min_hits} band hits" if band_min_hits > 1 else ""
     print(
@@ -972,6 +1120,24 @@ def main() -> None:
         "to this stage rather than bisected. The bands are NESTED — band k is "
         "the same permutation group at every setting — so a curve over this "
         "reads off one normalization pass. Mutually exclusive with --keys.",
+    )
+    p.add_argument(
+        "--max-pairs-total", type=int, default=1_500_000_000,
+        help="Refuse a key set projected to emit more than this many raw "
+        "pairs in total (default: %(default)s, roughly 12GB of partials). "
+        "Checked as the plan accumulates, so it stops after a few keys rather "
+        "than all of them. This is the limit that matters: at --band-cap 1000 "
+        "each band projects ~212M, under any sane per-key limit, while "
+        "sixteen of them come to 3.4 billion. 0 disables.",
+    )
+    p.add_argument(
+        "--max-pairs-per-key", type=int, default=400_000_000,
+        help="Refuse to emit a key projected to produce more than this many "
+        "raw pairs (default: %(default)s). The projection is EXACT and costs "
+        "a one-row aggregation, so this fails in seconds instead of an hour. "
+        "0 disables it. It exists because the first 16-band run emitted ~212M "
+        "raw pairs per band, 3.4 billion in total, and the only signal was "
+        "watching the partials pile up.",
     )
     p.add_argument(
         "--band-cap", type=int, default=None,
@@ -1049,7 +1215,8 @@ def main() -> None:
     block_split(
         a.split, work, a.budget, a.max_bucket, a.chunk, a.merge_buckets, keys,
         a.acronym_cap, a.acronym_min_len, a.bands if keys is None else None,
-        a.band_min_hits, a.band_cap,
+        a.band_min_hits, a.band_cap, a.max_pairs_per_key or None,
+        a.max_pairs_total or None,
     )
 
 

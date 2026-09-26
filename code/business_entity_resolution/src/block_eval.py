@@ -281,49 +281,107 @@ def budget_curve(
     truth = ground_truth_pairs(paths.ground_truth_tsv(data)).rename(
         {"matched_entity_id": "candidate_entity_id"}
     )
-    # Re-sort rather than trusting the file's row order. It happens to be
-    # written in per-entity score order, but relying on that silently couples
-    # this diagnostic to an implementation detail of the merge.
-    ranked = (
-        pl.read_parquet(cand_path)
-        .sort(
+
+    # Processed ONE MERGE BUCKET AT A TIME, and the reason is the same one the
+    # merge itself is bucketed for.
+    #
+    # This used to `pl.read_parquet` the whole candidate file eagerly and take
+    # a GLOBAL SORT over it. At four exact keys and budget 20 that is 23.6M
+    # rows and merely slow. With the LSH bands at budget 60 it is ~132M rows
+    # and a global sort of them, which is the "concatenating every partial and
+    # taking a global sort over ~100M rows wants 8-12GB" failure recorded in
+    # the journal -- fixed in `_merge` in session 3 and sitting here unnoticed
+    # ever since, in a diagnostic that runs on every single invocation.
+    #
+    # The sort is only ever needed per entity, and an entity's candidates are
+    # entirely inside one bucket by construction, so bucketing makes the
+    # ranking exact rather than approximate. Nothing is traded away.
+    #
+    # What accumulates across buckets is only the RANK OF EACH TRUE MATCH --
+    # about 4.9M rows of two columns at present -- not the candidate set.
+    cols = set(pl.scan_parquet(cand_path).collect_schema().names())
+    if "bucket" in cols:
+        bucket_ids = sorted(
+            pl.scan_parquet(cand_path).select("bucket").unique()
+            .collect().to_series().to_list()
+        )
+        def _read(b):
+            return pl.scan_parquet(cand_path).filter(pl.col("bucket") == b).collect()
+    else:
+        # A candidate file written before blocking recorded the column. Fall
+        # back to the old whole-file path rather than silently mis-ranking,
+        # but say so, because on a large file it is the expensive route.
+        print("  (candidate file predates the `bucket` column — reading it "
+              "whole, which needs several GB at this size)")
+        bucket_ids = [None]
+        def _read(_):
+            return pl.read_parquet(cand_path)
+
+    matched_parts = []
+    n_entities = 0
+    total_rows = 0
+    truth_eager = truth.collect()
+    for b in bucket_ids:
+        part = _read(b)
+        if part.is_empty():
+            continue
+        total_rows += part.height
+        n_entities += int(part["source1_entity_id"].n_unique())
+        ranked_b = part.sort(
             ["block_score", "n_keys", "candidate_entity_id"],
             descending=[True, True, False],
-        )
-        .with_columns(
+        ).with_columns(
             pl.int_range(pl.len()).over("source1_entity_id").alias("rank")
+        ).select("source1_entity_id", "candidate_entity_id", "rank")
+        matched_parts.append(
+            ranked_b.join(
+                truth_eager, on=["source1_entity_id", "candidate_entity_id"],
+                how="inner",
+            ).select("source1_entity_id", "rank")
         )
+        del part, ranked_b
+    matched = (
+        pl.concat(matched_parts, how="vertical") if matched_parts
+        else pl.DataFrame(schema={"source1_entity_id": pl.Utf8, "rank": pl.Int64})
     )
-    n_entities = int(ranked["source1_entity_id"].n_unique())
+    del matched_parts
+    # Denominator: every entity that has a true match, whether or not blocking
+    # found any of them. Taken from the ground truth rather than the candidate
+    # file, because an entity with zero candidates must count as zero recall
+    # and is absent from the candidate file entirely.
+    n_true_per_entity = (
+        truth_eager.group_by("source1_entity_id").len().rename({"len": "n_true"})
+    )
+
     _section("macro recall vs per-entity budget (same candidate file)")
     print(f"{'budget':>8} {'macro recall':>14} {'pair recall':>13} "
           f"{'candidates':>13} {'mean/entity':>12}")
     observed: list[tuple[int, float]] = []
+    n_true_total = int(n_true_per_entity["n_true"].sum())
+    # Per-entity candidate counts, once, so the "candidates" column at each cut
+    # is sum(min(count, k)) rather than the height of a materialized cut.
+    ent_sizes = (
+        pl.scan_parquet(cand_path).group_by("source1_entity_id").len()
+        .select(pl.col("len")).collect().to_series()
+    )
     for k in cuts:
-        cut = ranked.filter(pl.col("rank") < k)
-        per_entity = (
-            truth.join(
-                cut.lazy().select("source1_entity_id", "candidate_entity_id")
-                .with_columns(pl.lit(True).alias("found")),
-                on=["source1_entity_id", "candidate_entity_id"],
-                how="left",
-            )
-            .group_by("source1_entity_id")
-            .agg(
-                pl.len().alias("n_true"),
-                pl.col("found").fill_null(False).sum().alias("n_found"),
-            )
-            .collect()
+        found = (
+            matched.filter(pl.col("rank") < k)
+            .group_by("source1_entity_id").len().rename({"len": "n_found"})
         )
+        per_entity = n_true_per_entity.join(
+            found, on="source1_entity_id", how="left"
+        ).with_columns(pl.col("n_found").fill_null(0))
         if per_entity.is_empty():
             continue
-        macro = float(
-            (per_entity["n_found"] / per_entity["n_true"]).mean()
-        )
-        pair = int(per_entity["n_found"].sum()) / int(per_entity["n_true"].sum())
+        # Candidate count at this cut without materializing the cut: every
+        # entity contributes min(its own count, k).
+        n_cut = int(ent_sizes.clip(upper_bound=k).sum())
+        macro = float((per_entity["n_found"] / per_entity["n_true"]).mean())
+        pair = int(per_entity["n_found"].sum()) / max(n_true_total, 1)
         observed.append((k, macro))
-        print(f"{k:>8} {macro:>13.2%} {pair:>12.2%} {cut.height:>13,} "
-              f"{cut.height / max(n_entities, 1):>11.2f}")
+        print(f"{k:>8} {macro:>13.2%} {pair:>12.2%} {n_cut:>13,} "
+              f"{n_cut / max(n_entities, 1):>11.2f}")
 
     # Read the curve rather than printing advice for both cases and leaving the
     # reader to pick. The first version printed "still climbing -> raise the

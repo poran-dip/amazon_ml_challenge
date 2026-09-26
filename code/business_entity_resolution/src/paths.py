@@ -74,9 +74,29 @@ def normalized_parquet(split: str, source: int, work: Path) -> Path:
     return _sub(work, "normalized") / f"{split}_source{source}.parquet"
 
 
-def partial_parquet(split: str, key: str, work: Path) -> Path:
-    """One blocking key's raw hits, before the merge."""
-    return _sub(work, "candidates") / f"{split}_partial_{key}.parquet"
+def partial_parquet(split: str, key: str, work: Path, bucket: int) -> Path:
+    """One blocking key's raw hits for ONE merge bucket, before the merge.
+
+    Partitioned by `hash(source1_entity_id) % merge_buckets` at WRITE time
+    rather than filtered at read time. The merge processes one bucket at a
+    time, so an unpartitioned partial has to be re-read and re-filtered once
+    per bucket — 16 full passes over every partial, and with the LSH bands
+    that is tens of GB of decompression per run for data that was already
+    written in the right order to avoid it. The filter is also on a computed
+    hash, so parquet statistics cannot skip a single row group.
+    """
+    return _sub(work, "candidates") / f"{split}_partial_{key}_b{bucket:02d}.parquet"
+
+
+def partial_glob(split: str, work: Path) -> str:
+    """Every partial for a split, for cleaning stale ones between runs.
+
+    Stale partials are not merely wasted disk: the merge globs by bucket, so a
+    partial left over from a run with a different `--merge-buckets`, a
+    different key set or a different cap would be silently folded into the
+    next run's candidate set.
+    """
+    return str(_sub(work, "candidates") / f"{split}_partial_*.parquet")
 
 
 def candidates_parquet(split: str, work: Path) -> Path:
