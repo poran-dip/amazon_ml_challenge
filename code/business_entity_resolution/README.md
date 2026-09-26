@@ -28,6 +28,29 @@ python -m src.blocking   --split train --budget 20  # seconds
 python -m src.block_eval --split train              # what that blocking bought
 ```
 
+### Seeing where a run is: `--progress`
+
+A full run takes on the order of two hours and, before this flag, reported almost nothing while it did — each stage printed one summary line *after* it finished, so a run that was going to die at minute 90 on memory looked identical for its first 89 minutes to one that was going to succeed. `--progress` is on every entry point:
+
+```bash
+python -m src.main --split train --progress
+python -m src.blocking --split train --progress        # same flag on each stage
+AMLC_PROGRESS=1 python -m src.main --split train       # or via the environment
+```
+
+It writes live lines to **stderr** — stage in, stage out with elapsed time, and a rewritten-in-place position line for every loop with its rate, ETA, resident memory, peak memory, free system memory and bytes written so far. Results still go to stdout, so `--progress > run.log` puts the report in the file and leaves the progress on the terminal.
+
+Independently of the flag, every stage appends one JSON record to **`work/timings.jsonl`** (disable with `--no-timings`). It accumulates across runs, which is what makes this run comparable with the last one, and a `stage_start` record is written on entry as well as on exit, so a run that was killed still says how far it got. Read it back with:
+
+```bash
+python -m src.timings              # last run, slowest stage first, with self time
+python -m src.timings --tree       # nesting and execution order instead
+python -m src.timings --runs 3     # compare the last three
+python -m src.timings --list       # every run in the file
+```
+
+Rank by the **self** column, not total: a parent's total includes its children, so ranking by total puts `model` on top of every run and tells you nothing. Memory needs `psutil` (in `requirements.txt`); without it the timings still work and the memory and disk columns read `-`.
+
 Outputs go to `output/matching_results.tsv` and `output/candidate_pairs.tsv` at the repo root, or wherever `--out-dir` points. **Both splits write to the same directory**, so run `--split test` last (or give it its own `--out-dir`) — a training run afterwards overwrites the submission with training predictions.
 
 Validate before submitting, from the `student_resource/` directory:
