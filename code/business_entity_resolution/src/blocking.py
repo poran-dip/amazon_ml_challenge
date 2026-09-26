@@ -91,11 +91,42 @@ BAND_KEYS: tuple[str, ...] = minhash.band_columns(N_BANDS)
 #     `name_sorted`'s 1.0 — so only near-identical trigrams outrank identical
 #     sorted tokens, which is the intended ordering.
 #
-# The cap is tighter than the name keys' 2000. A band bucket holding 1000
-# records is 1000 records with near-identical 3-gram sets, which on this data
-# means a generic name rather than a cluster of true matches.
+# The cap was set to 1000 by the argument that "a band bucket holding 1000
+# records is 1000 records with near-identical 3-gram sets, so a generic name
+# rather than a cluster of true matches". The argument was right and the number
+# was wrong by two orders of magnitude, which the first real run showed:
+#
+#   band_00: 9,143,872 targets in 2,316,663 buckets -> mean bucket size 3.95
+#            217,324,475 raw pairs over 2,206,821 entities -> 98.5 per entity
+#
+# Those two numbers are both true and describe different things. Each source-1
+# entity has exactly ONE signature per band, so it joins exactly one bucket,
+# and the bucket an average RECORD lands in is the size-biased mean -- 98.5,
+# not 3.95. The 25x gap is a heavy tail: a small number of buckets just under
+# the cap absorb almost every record. Only 472 of 2.3M buckets exceeded 1000,
+# so the cap was barely doing anything.
+#
+# At sixteen bands that is ~3.4 BILLION raw pairs against 210M for all four
+# exact keys combined, which is 30-50GB of partials and a merge that cannot
+# fit. A truncated-Pareto fit to (mean, size-biased mean) gives an exponent of
+# 2.105 and predicts:
+#
+#   cap    pairs/entity/band    16 bands
+#   1000        98.5            3.48B
+#    200        27.5            0.97B
+#    100        16.2            0.57B
+#     50         9.7            0.34B
+#     25         5.9            0.21B   (= today's exact-key total)
+#
+# Lowering it also shrinks `candidate_pairs.tsv`, which the organisers now
+# score. The cap costs recall -- an over-cap bucket is dropped whole -- but the
+# bands are redundant with each other, so the UNION cost is far below the
+# per-band cost: at cap 1000 each band lost 6-9% while the union lost 3.18%.
+#
+# Exposed as `--band-cap` because the right value is an empirical question
+# about this corpus, not something to re-derive by argument a second time.
 BAND_WEIGHT = 0.10
-BAND_CAP = 1000
+BAND_CAP = 100
 
 # (column, weight, bucket cap).
 #
@@ -799,6 +830,7 @@ def block_split(
     acronym_min_len: int = 0,
     bands: int | None = None,
     band_min_hits: int = 1,
+    band_cap: int | None = None,
     char_ngram: bool = False,
     ngram_n: int = 5,
     ngram_max_bucket: int = 200,
@@ -868,6 +900,9 @@ def block_split(
         if key == "name_acronym":
             cap = acronym_cap or cap
             min_len = acronym_min_len
+        elif is_band(key):
+            cap = band_cap or cap
+            min_len = 0
         else:
             min_len = 0
         partials.append(
@@ -939,6 +974,16 @@ def main() -> None:
         "reads off one normalization pass. Mutually exclusive with --keys.",
     )
     p.add_argument(
+        "--band-cap", type=int, default=None,
+        help=f"Bucket cap for every LSH band (default: its KEY_SPECS value, "
+        f"{BAND_CAP}). THE fan-out knob. Each source-1 entity joins exactly "
+        "one bucket per band, so pairs-per-entity is the SIZE-BIASED mean "
+        "bucket size, not the mean -- at cap 1000 those were 98.5 and 3.95 "
+        "respectively, i.e. 3.4 billion raw pairs across 16 bands against "
+        "210M for all the exact keys together. Roughly halves per halving of "
+        "the cap. See the note above KEY_SPECS.",
+    )
+    p.add_argument(
         "--band-min-hits", type=int, default=1,
         help="How many LSH bands must agree before a pair with NO exact-key "
         "evidence is admitted (default: %(default)s). This is the "
@@ -990,7 +1035,7 @@ def main() -> None:
             f"{k}={a.acronym_cap or c if k == 'name_acronym' else c}"
             for k, _, c in KEY_SPECS
             if k in exact_sel
-        ) + (f", {n_band_sel} bands={BAND_CAP}" if n_band_sel else "")
+        ) + (f", {n_band_sel} bands={a.band_cap or BAND_CAP}" if n_band_sel else "")
     )
     print(f"blocking [{a.split}]  work={work}  budget={a.budget}")
     print(f"  exact keys: {', '.join(exact_sel) or '(none)'}")
@@ -1004,7 +1049,7 @@ def main() -> None:
     block_split(
         a.split, work, a.budget, a.max_bucket, a.chunk, a.merge_buckets, keys,
         a.acronym_cap, a.acronym_min_len, a.bands if keys is None else None,
-        a.band_min_hits,
+        a.band_min_hits, a.band_cap,
     )
 
 

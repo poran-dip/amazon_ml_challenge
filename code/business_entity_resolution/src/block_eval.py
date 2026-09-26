@@ -345,9 +345,27 @@ def budget_curve(
 
 def key_diagnostics(
     split: str, work: Path, data: Path, max_bucket: int | None,
-    sample_pairs: int | None,
+    sample_pairs: int | None, acronym_cap: int | None = None,
+    band_cap: int | None = None,
 ) -> None:
-    caps = {k: (max_bucket or c) for k, _, c in blocking.KEY_SPECS}
+    # The caps must be the ones BLOCKING ran with, not the KEY_SPECS defaults.
+    # This function used to read the defaults only, so `--acronym-cap 500` (and
+    # later `--band-cap`) changed the candidate file while `usable`, `cap cost`
+    # and both UNION lines went on describing a run that never happened.
+    # Measured: a 40x sweep of --band-cap moved macro recall from 81.48% to
+    # 77.29% while `the bucket cap costs` sat at 1.25% for every point -- a
+    # number that cannot move is not a measurement, which is the session-4
+    # budget-curve lesson in a third place.
+    def _cap(key: str, default: int) -> int:
+        if max_bucket:
+            return max_bucket
+        if key == "name_acronym" and acronym_cap:
+            return acronym_cap
+        if blocking.is_band(key) and band_cap:
+            return band_cap
+        return default
+
+    caps = {k: _cap(k, c) for k, _, c in blocking.KEY_SPECS}
     keys = list(caps)
 
     _section("per-key diagnostics")
@@ -516,6 +534,17 @@ def main() -> None:
     p.add_argument("--data-root", default=None)
     p.add_argument("--budget", type=int, default=20,
                    help="Budget blocking was run with, for the shortfall count.")
+    p.add_argument(
+        "--acronym-cap", type=int, default=None,
+        help="The --acronym-cap BLOCKING was run with. The per-key table is "
+        "recomputed from the normalized parquet, so it has no way to know "
+        "which caps produced the candidate file and will describe the "
+        "defaults unless told.",
+    )
+    p.add_argument(
+        "--band-cap", type=int, default=None,
+        help="The --band-cap BLOCKING was run with. See --acronym-cap.",
+    )
     p.add_argument("--max-bucket", type=int, default=None,
                    help="Global cap override for the diagnostics. Leave unset "
                         "to use each key's own cap from KEY_SPECS.")
@@ -566,7 +595,8 @@ def main() -> None:
             budget_curve(a.split, work, data, cand_path, cuts)
 
     if not a.no_key_diagnostics:
-        key_diagnostics(a.split, work, data, a.max_bucket, a.sample_pairs)
+        key_diagnostics(a.split, work, data, a.max_bucket, a.sample_pairs,
+                    a.acronym_cap, a.band_cap)
 
 
 if __name__ == "__main__":
