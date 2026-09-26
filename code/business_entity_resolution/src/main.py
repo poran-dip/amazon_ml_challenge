@@ -386,6 +386,20 @@ def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
 # `_is_fresh`. See the comment there for why a library version has to be part
 # of the cache key when a hash is part of the payload.
 POLARS_VERSION_KEY = b"amlc_polars_version"
+# Whether the cache was built with romanization on. Stamped for the same
+# reason the polars version is, and closing a gap the previous docstring
+# merely APOLOGISED for: "toggling --translit changes the output without
+# touching any file, so it does not invalidate the cache. --force-normalize is
+# the answer there."
+#
+# Documenting a footgun is not removing it. --translit rewrites every name and
+# address before normalization, so it changes name_core, every blocking key,
+# the trigrams and therefore all sixteen LSH band signatures — and none of the
+# three existing guards can see it, because it touches no file, changes no row
+# count and is not a library version. Forgetting --force-normalize on a run
+# that toggles it silently measures the OTHER setting, which is precisely the
+# class of bug this project has hit in sessions 3, 4 and 5.
+TRANSLIT_KEY = b"amlc_translit"
 
 
 # Modules whose contents change what `prepare_full` writes. Adding `minhash`
@@ -439,7 +453,10 @@ def _rule_mtime() -> float:
     )
 
 
-def _is_fresh(parquet: Path, source: Path, expected_rows: int | None) -> bool:
+def _is_fresh(
+    parquet: Path, source: Path, expected_rows: int | None,
+    use_translit: bool = False,
+) -> bool:
     """Whether a cached parquet can be reused.
 
     Three guards, all earned. The cache must be newer than the source data AND
@@ -461,7 +478,9 @@ def _is_fresh(parquet: Path, source: Path, expected_rows: int | None) -> bool:
 
         pf = pq.ParquetFile(parquet)
         rows = pf.metadata.num_rows
-        stamped = (pf.schema_arrow.metadata or {}).get(POLARS_VERSION_KEY, b"")
+        meta = pf.schema_arrow.metadata or {}
+        stamped = meta.get(POLARS_VERSION_KEY, b"")
+        stamped_translit = meta.get(TRANSLIT_KEY)
     except Exception:
         return False
     # `name_trigrams` holds polars hash values, and a hash is only meaningful
@@ -473,6 +492,12 @@ def _is_fresh(parquet: Path, source: Path, expected_rows: int | None) -> bool:
     # above cannot see this, because upgrading a library touches none of the
     # files they watch.
     if stamped.decode(errors="replace") != pl.__version__:
+        return False
+    # A cache with no translit stamp predates this guard and cannot be
+    # vouched for either way, so it is rebuilt once rather than trusted.
+    if stamped_translit is None:
+        return False
+    if stamped_translit != (b"1" if use_translit else b"0"):
         return False
     return expected_rows is None or rows == expected_rows
 
@@ -516,7 +541,7 @@ def ensure_normalized(
             None if available is None
             else (min(limit, available) if limit else available)
         )
-        if not force and _is_fresh(dst, src, expected):
+        if not force and _is_fresh(dst, src, expected, use_translit):
             shape = f"{expected:,} rows" if expected is not None else "row count unverified"
             print(f"  source{source}: reusing {dst.name} ({shape})")
             continue
@@ -532,9 +557,10 @@ def ensure_normalized(
                 # Stamp every chunk, not just the first: the writer is created
                 # from the first chunk's schema and pyarrow requires each
                 # subsequent table's schema to match it, metadata included.
-                table = table.replace_schema_metadata(
-                    {POLARS_VERSION_KEY: pl.__version__.encode()}
-                )
+                table = table.replace_schema_metadata({
+                    POLARS_VERSION_KEY: pl.__version__.encode(),
+                    TRANSLIT_KEY: b"1" if use_translit else b"0",
+                })
                 if writer is None:
                     writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
                 writer.write_table(table)
