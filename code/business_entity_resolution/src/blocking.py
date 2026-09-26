@@ -358,6 +358,271 @@ def _merge(
     return raw, kept
 
 
+def _emit_ngram(
+    split: str,
+    work: Path,
+    n: int = 5,
+    max_bucket: int = 200,
+    chunk: int = 250_000,
+) -> Path | None:
+    """Character n-gram blocking partial table."""
+    import pyarrow.parquet as pq
+
+    tgt_scan = pl.concat([
+        pl.scan_parquet(paths.normalized_parquet(split, s, work)).select(
+            pl.col("entity_id").alias("candidate_entity_id"),
+            pl.col("country_norm").fill_null(""),
+            pl.col("name_nospace").fill_null(""),
+        )
+        for s in (2, 3)
+    ])
+
+    def add_ngrams(col: pl.Expr) -> pl.Expr:
+        return (
+            col.str.to_lowercase()
+            .str.replace_all(r"[^a-z0-9]+", "")
+            .map_elements(
+                lambda x: [x[i:i + n] for i in range(max(0, len(x) - n + 1))],
+                return_dtype=pl.List(pl.Utf8),
+            )
+            .list.unique()
+        )
+
+    targets = (
+        tgt_scan
+        .with_columns(add_ngrams(pl.col("name_nospace")).alias("gram"))
+        .explode("gram")
+        .filter(pl.col("gram") != "")
+        .with_columns(
+            pl.concat_str([pl.col("country_norm"), pl.lit("|"), pl.col("gram")]).alias("bk")
+        )
+        .select("candidate_entity_id", "bk")
+        .collect()
+    )
+
+    sizes = targets.group_by("bk").len().rename({"len": "bucket_size"})
+    keep = sizes.filter(pl.col("bucket_size") <= max_bucket)
+    targets = targets.join(keep, on="bk", how="inner")
+
+    s1 = (
+        pl.scan_parquet(paths.normalized_parquet(split, 1, work))
+        .select(
+            pl.col("entity_id").alias("source1_entity_id"),
+            pl.col("country_norm").fill_null(""),
+            pl.col("name_nospace").fill_null(""),
+        )
+        .with_columns(add_ngrams(pl.col("name_nospace")).alias("gram"))
+        .explode("gram")
+        .filter(pl.col("gram") != "")
+        .with_columns(
+            pl.concat_str([pl.col("country_norm"), pl.lit("|"), pl.col("gram")]).alias("bk")
+        )
+        .select("source1_entity_id", "bk")
+        .collect()
+    )
+
+    dst = paths.partial_parquet(split, f"ngram_n{n}", work)
+    writer = None
+    emitted = 0
+    try:
+        for offset in range(0, max(s1.height, 1), chunk):
+            block = s1.slice(offset, chunk)
+            if block.is_empty():
+                continue
+            hits = block.join(targets, on="bk", how="inner").select(
+                pl.col("source1_entity_id"),
+                pl.col("candidate_entity_id"),
+                (pl.lit(0.75, dtype=pl.Float32) / (pl.col("bucket_size").cast(pl.Float32) + 1.0).log(2.0)).alias("w"),
+            )
+            if hits.is_empty():
+                continue
+            table = hits.to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
+            writer.write_table(table)
+            emitted += hits.height
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if writer is None:
+        print(f"    ngram_n{n:<8} no candidates emitted")
+        return None
+    print(f"    ngram_n{n:<8} {emitted:>12,} raw pairs -> {dst.name}")
+    return dst
+
+
+def _emit_prefix(
+    split: str,
+    work: Path,
+    prefix_len: int = 3,
+    max_bucket: int = 500,
+    chunk: int = 250_000,
+) -> Path | None:
+    """Prefix blocking partial table."""
+    import pyarrow.parquet as pq
+
+    tgt_scan = pl.concat([
+        pl.scan_parquet(paths.normalized_parquet(split, s, work)).select(
+            pl.col("entity_id").alias("candidate_entity_id"),
+            pl.col("country_norm").fill_null(""),
+            pl.col("name_nospace").fill_null(""),
+        )
+        for s in (2, 3)
+    ])
+
+    targets = (
+        tgt_scan
+        .with_columns(
+            pl.col("name_nospace")
+            .str.to_lowercase()
+            .str.replace_all(r"[^a-z0-9]+", "")
+            .str.slice(0, prefix_len)
+            .alias("pfx")
+        )
+        .filter(pl.col("pfx") != "")
+        .with_columns(
+            pl.concat_str([pl.col("country_norm"), pl.lit("|"), pl.col("pfx")]).alias("bk")
+        )
+        .select("candidate_entity_id", "bk")
+        .collect()
+    )
+
+    sizes = targets.group_by("bk").len().rename({"len": "bucket_size"})
+    keep = sizes.filter(pl.col("bucket_size") <= max_bucket)
+    targets = targets.join(keep, on="bk", how="inner")
+
+    s1 = (
+        pl.scan_parquet(paths.normalized_parquet(split, 1, work))
+        .select(
+            pl.col("entity_id").alias("source1_entity_id"),
+            pl.col("country_norm").fill_null(""),
+            pl.col("name_nospace").fill_null(""),
+        )
+        .with_columns(
+            pl.col("name_nospace")
+            .str.to_lowercase()
+            .str.replace_all(r"[^a-z0-9]+", "")
+            .str.slice(0, prefix_len)
+            .alias("pfx")
+        )
+        .filter(pl.col("pfx") != "")
+        .with_columns(
+            pl.concat_str([pl.col("country_norm"), pl.lit("|"), pl.col("pfx")]).alias("bk")
+        )
+        .select("source1_entity_id", "bk")
+        .collect()
+    )
+
+    dst = paths.partial_parquet(split, f"prefix_len{prefix_len}", work)
+    writer = None
+    emitted = 0
+    try:
+        for offset in range(0, max(s1.height, 1), chunk):
+            block = s1.slice(offset, chunk)
+            if block.is_empty():
+                continue
+            hits = block.join(targets, on="bk", how="inner").select(
+                pl.col("source1_entity_id"),
+                pl.col("candidate_entity_id"),
+                (pl.lit(0.70, dtype=pl.Float32) / (pl.col("bucket_size").cast(pl.Float32) + 1.0).log(2.0)).alias("w"),
+            )
+            if hits.is_empty():
+                continue
+            table = hits.to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
+            writer.write_table(table)
+            emitted += hits.height
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if writer is None:
+        print(f"    prefix_len{prefix_len:<6} no candidates emitted")
+        return None
+    print(f"    prefix_len{prefix_len:<6} {emitted:>12,} raw pairs -> {dst.name}")
+    return dst
+
+
+def _emit_tfidf(
+    split: str,
+    work: Path,
+    top_k: int = 20,
+    batch_size: int = 500,
+) -> Path | None:
+    """Batched sparse TF-IDF partial table."""
+    import numpy as np
+    import pyarrow.parquet as pq
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    s1_df = pl.scan_parquet(paths.normalized_parquet(split, 1, work)).select(
+        pl.col("entity_id"),
+        pl.col("name_sorted").fill_null(""),
+    ).collect()
+
+    tgt_df = pl.concat([
+        pl.scan_parquet(paths.normalized_parquet(split, s, work)).select(
+            pl.col("entity_id"),
+            pl.col("name_sorted").fill_null(""),
+        )
+        for s in (2, 3)
+    ]).collect()
+
+    s1_names = s1_df["name_sorted"].to_list()
+    tgt_names = tgt_df["name_sorted"].to_list()
+    s1_ids = s1_df["entity_id"].to_list()
+    tgt_ids = tgt_df["entity_id"].to_list()
+
+    vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(2, 5), lowercase=True, min_df=2)
+    all_vecs = vectorizer.fit_transform(s1_names + tgt_names)
+    s1_mat = all_vecs[:len(s1_names)]
+    tgt_mat = all_vecs[len(s1_names):]
+
+    dst = paths.partial_parquet(split, f"tfidf_top{top_k}", work)
+    writer = None
+    emitted = 0
+
+    num_s1 = len(s1_names)
+    for b in range(0, num_s1, batch_size):
+        b_end = min(b + batch_size, num_s1)
+        s1_sub = s1_mat[b:b_end]
+        sims = (s1_sub * tgt_mat.T).toarray()
+
+        rows = []
+        for local_idx, global_idx in enumerate(range(b, b_end)):
+            row = sims[local_idx]
+            if len(row) > top_k:
+                top_indices = np.argpartition(row, -top_k)[-top_k:]
+                top_indices = top_indices[np.argsort(-row[top_indices])]
+            else:
+                top_indices = np.argsort(-row)
+
+            for idx in top_indices:
+                score = float(row[idx])
+                if score > 0.0:
+                    rows.append((s1_ids[global_idx], tgt_ids[idx], score * 0.85))
+
+        if rows:
+            table = pl.DataFrame(
+                rows,
+                schema={"source1_entity_id": pl.Utf8, "candidate_entity_id": pl.Utf8, "w": pl.Float32},
+                orient="row",
+            ).to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
+            writer.write_table(table)
+            emitted += len(rows)
+
+    if writer is not None:
+        writer.close()
+    if writer is None:
+        print(f"    tfidf_top{top_k:<6} no candidates emitted")
+        return None
+    print(f"    tfidf_top{top_k:<6} {emitted:>12,} raw pairs -> {dst.name}")
+    return dst
+
+
 def block_split(
     split: str,
     work: Path,
@@ -368,11 +633,19 @@ def block_split(
     keys: tuple[str, ...] | None = None,
     acronym_cap: int | None = None,
     acronym_min_len: int = 0,
+    char_ngram: bool = False,
+    ngram_n: int = 5,
+    ngram_max_bucket: int = 200,
+    prefix: bool = False,
+    prefix_len: int = 3,
+    prefix_max_bucket: int = 500,
+    tfidf: bool = False,
+    tfidf_top_k: int = 20,
 ) -> Path:
     """Run stage A end to end and return the candidate parquet's path."""
     selected = keys if keys is not None else DEFAULT_KEYS
     specs = [s for s in KEY_SPECS if s[0] in selected]
-    if not specs:
+    if not specs and not (char_ngram or prefix or tfidf):
         raise ValueError(f"no keys selected; available: {list(KEY_COLUMNS)}")
     unknown = set(selected) - set(KEY_COLUMNS)
     if unknown:
@@ -402,6 +675,14 @@ def block_split(
         partials.append(
             _emit_key(split, work, key, weight, max_bucket or cap, chunk, min_len)
         )
+
+    if char_ngram:
+        partials.append(_emit_ngram(split, work, n=ngram_n, max_bucket=ngram_max_bucket, chunk=chunk))
+    if prefix:
+        partials.append(_emit_prefix(split, work, prefix_len=prefix_len, max_bucket=prefix_max_bucket, chunk=chunk))
+    if tfidf:
+        partials.append(_emit_tfidf(split, work, top_k=tfidf_top_k))
+
     partials = [p for p in partials if p is not None]
     if not partials:
         raise RuntimeError(
@@ -417,6 +698,7 @@ def block_split(
         f"-> {dst.name} ({elapsed:.1f}s)"
     )
     return dst
+
 
 
 def main() -> None:
@@ -494,5 +776,246 @@ def main() -> None:
     )
 
 
+# --------------------------------------------------------------------------
+# standalone / experimental blocking functions
+# --------------------------------------------------------------------------
+
+def character_ngram_blocking(
+    source1: pl.DataFrame,
+    targets: pl.DataFrame,
+    n: int = 3,
+    max_bucket: int = 100,
+) -> pl.DataFrame:
+    """
+    Generate candidate pairs using character n-gram blocking.
+
+    Expected columns:
+        source1:
+            entity_id
+            business_name
+            country
+
+        targets:
+            candidate_entity_id
+            business_name
+            country
+
+    Returns:
+        source1_entity_id
+        candidate_entity_id
+    """
+
+    def add_ngrams(col: pl.Expr) -> pl.Expr:
+        return (
+            col.fill_null("")
+            .str.to_lowercase()
+            .str.replace_all(r"[^a-z0-9]+", "")
+            .map_elements(
+                lambda x: [x[i:i + n] for i in range(max(0, len(x) - n + 1))],
+                return_dtype=pl.List(pl.Utf8),
+            )
+            .list.unique()
+        )
+
+    s1 = source1.with_columns(
+        add_ngrams(pl.col("business_name")).alias("name_ngrams")
+    )
+
+    tgt = targets.with_columns(
+        add_ngrams(pl.col("business_name")).alias("name_ngrams")
+    )
+
+    s1 = s1.explode("name_ngrams")
+    tgt = tgt.explode("name_ngrams")
+
+    # Remove empty n-grams.
+    s1 = s1.filter(pl.col("name_ngrams") != "")
+    tgt = tgt.filter(pl.col("name_ngrams") != "")
+
+    # Remove extremely common n-grams.
+    counts = tgt.group_by("name_ngrams").len()
+    valid = counts.filter(
+        pl.col("len") <= max_bucket
+    ).select("name_ngrams")
+
+    s1 = s1.join(valid, on="name_ngrams", how="inner")
+    tgt = tgt.join(valid, on="name_ngrams", how="inner")
+
+    candidates = (
+        s1.join(
+            tgt,
+            on="name_ngrams",
+            how="inner",
+            suffix="_target",
+        )
+        .select(
+            pl.col("entity_id").alias("source1_entity_id"),
+            pl.col("candidate_entity_id"),
+        )
+        .unique()
+    )
+
+    return candidates
+
+
+def prefix_blocking(
+    source1: pl.DataFrame,
+    targets: pl.DataFrame,
+    prefix_length: int = 4,
+    max_bucket: int = 100,
+) -> pl.DataFrame:
+    """
+    Generate candidate pairs using a normalized business-name prefix.
+
+    Example:
+        "ABC Technologies Pvt Ltd"
+                    ↓
+        prefix = "abct"
+
+    Returns:
+        source1_entity_id
+        candidate_entity_id
+    """
+
+    def prefix_key(col: pl.Expr) -> pl.Expr:
+        return (
+            col.fill_null("")
+            .str.to_lowercase()
+            .str.replace_all(r"[^a-z0-9]+", "")
+            .str.slice(0, prefix_length)
+        )
+
+    s1 = source1.with_columns(
+        prefix_key(pl.col("business_name")).alias("prefix_key")
+    )
+
+    tgt = targets.with_columns(
+        prefix_key(pl.col("business_name")).alias("prefix_key")
+    )
+
+    # Ignore empty prefixes.
+    s1 = s1.filter(pl.col("prefix_key") != "")
+    tgt = tgt.filter(pl.col("prefix_key") != "")
+
+    # Remove prefixes shared by too many target records.
+    counts = tgt.group_by("prefix_key").len()
+
+    valid = counts.filter(
+        pl.col("len") <= max_bucket
+    ).select("prefix_key")
+
+    s1 = s1.join(valid, on="prefix_key", how="inner")
+    tgt = tgt.join(valid, on="prefix_key", how="inner")
+
+    candidates = (
+        s1.join(
+            tgt,
+            on="prefix_key",
+            how="inner",
+            suffix="_target",
+        )
+        .select(
+            pl.col("entity_id").alias("source1_entity_id"),
+            pl.col("candidate_entity_id"),
+        )
+        .unique()
+    )
+
+    return candidates
+
+
+def tfidf_retrieval_blocking(
+    source1: pl.DataFrame,
+    targets: pl.DataFrame,
+    top_k: int = 20,
+) -> pl.DataFrame:
+    """
+    Generate candidates using TF-IDF cosine similarity.
+
+    Each Source-1 business retrieves its top_k most similar
+    target business names.
+
+    Returns:
+        source1_entity_id
+        candidate_entity_id
+        tfidf_similarity
+    """
+
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    s1_names = (
+        source1["business_name"]
+        .fill_null("")
+        .cast(pl.Utf8)
+        .to_list()
+    )
+
+    target_names = (
+        targets["business_name"]
+        .fill_null("")
+        .cast(pl.Utf8)
+        .to_list()
+    )
+
+    # Character TF-IDF is useful for spelling variations.
+    vectorizer = TfidfVectorizer(
+        analyzer="char",
+        ngram_range=(2, 5),
+        lowercase=True,
+        min_df=1,
+    )
+
+    all_names = s1_names + target_names
+
+    matrix = vectorizer.fit_transform(all_names)
+
+    s1_matrix = matrix[:len(s1_names)]
+    target_matrix = matrix[len(s1_names):]
+
+    similarities = cosine_similarity(
+        s1_matrix,
+        target_matrix,
+    )
+
+    source1_ids = source1["entity_id"].to_list()
+    target_ids = targets["candidate_entity_id"].to_list()
+
+    candidate_rows = []
+
+    for i, source1_id in enumerate(source1_ids):
+
+        scores = similarities[i]
+
+        # Get only the top-k target records.
+        if len(scores) > top_k:
+            top_indices = scores.argsort()[-top_k:][::-1]
+        else:
+            top_indices = scores.argsort()[::-1]
+
+        for idx in top_indices:
+
+            score = float(scores[idx])
+
+            candidate_rows.append(
+                (
+                    source1_id,
+                    target_ids[idx],
+                    score,
+                )
+            )
+
+    return pl.DataFrame(
+        candidate_rows,
+        schema=[
+            "source1_entity_id",
+            "candidate_entity_id",
+            "tfidf_similarity",
+        ],
+        orient="row",
+    )
+
+
 if __name__ == "__main__":
     main()
+
