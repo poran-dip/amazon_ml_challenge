@@ -69,7 +69,7 @@ from pathlib import Path
 
 import polars as pl
 
-from . import blocking, block_eval, paths
+from . import blocking, block_eval, paths, progress
 
 # Hashing tokens/numbers for comparison only — never for reconstruction. Kept
 # distinct from `text_norm.TRIGRAM_HASH_SEED` so that a trigram hash and a
@@ -465,20 +465,28 @@ def build_features(
         )
 
     started = time.perf_counter()
-    s1 = _suffixed(_attributes(split, (1,), work, "source1_entity_id"), "source1_entity_id", "_e")
-    tgt = _suffixed(
-        _attributes(split, (2, 3), work, "candidate_entity_id"), "candidate_entity_id", "_c"
-    )
+    with progress.stage("attributes") as st:
+        s1 = _suffixed(_attributes(split, (1,), work, "source1_entity_id"), "source1_entity_id", "_e")
+        tgt = _suffixed(
+            _attributes(split, (2, 3), work, "candidate_entity_id"), "candidate_entity_id", "_c"
+        )
+        # Both frames stay resident for every bucket, so this is the floor the
+        # per-bucket join sits on top of. Never measured before.
+        st.set(rows=s1.height + tgt.height,
+               s1_mb=round(s1.estimated_size("mb"), 1),
+               tgt_mb=round(tgt.estimated_size("mb"), 1))
     print(f"  attributes: {s1.height:,} source-1, {tgt.height:,} target")
 
     truth = None
     if split == "train":
-        truth = (
-            block_eval.ground_truth_pairs(paths.ground_truth_tsv(data))
-            .rename({"matched_entity_id": "candidate_entity_id"})
-            .with_columns(pl.lit(1, dtype=pl.UInt8).alias("label"))
-            .collect()
-        )
+        with progress.stage("ground-truth") as st:
+            truth = (
+                block_eval.ground_truth_pairs(paths.ground_truth_tsv(data))
+                .rename({"matched_entity_id": "candidate_entity_id"})
+                .with_columns(pl.lit(1, dtype=pl.UInt8).alias("label"))
+                .collect()
+            )
+            st.set(rows=truth.height)
         print(f"  ground truth: {truth.height:,} true pairs")
 
     cand_cols = set(pl.scan_parquet(cand_path).collect_schema().names())
@@ -494,6 +502,15 @@ def build_features(
     writer = None
     total = 0
     positives = 0
+    # Denominated in PAIRS rather than buckets: the candidate row count is known
+    # up front from the parquet footer (a metadata read, not a scan), and a
+    # pair-level ETA is what tells you whether the feature build will finish
+    # before the submission window closes.
+    try:
+        n_cand_expected = pl.scan_parquet(cand_path).select(pl.len()).collect().item()
+    except Exception:  # noqa: BLE001 - telemetry must not break the build
+        n_cand_expected = None
+    tick = progress.ticker(n_cand_expected, unit="pairs", label="featurize")
     try:
         for b in range(merge_buckets):
             # Filter on the materialized `bucket` column that blocking now
@@ -516,6 +533,7 @@ def build_features(
             if has_bucket and not chunk.is_empty():
                 chunk = chunk.drop("bucket")
             if chunk.is_empty():
+                tick.advance(0, bucket=f"{b + 1}/{merge_buckets}")
                 continue
             # Inner joins on both sides. A candidate whose attributes are
             # missing cannot be featurized at all, and silently carrying it
@@ -540,11 +558,26 @@ def build_features(
                 writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
             writer.write_table(table)
             total += out.height
-            print(f"    bucket {b + 1}/{merge_buckets}   {total:,} pairs", end="\r")
+            tick.advance(out.height, bucket=f"{b + 1}/{merge_buckets}",
+                         pos=positives)
+            if not progress.console_enabled():
+                print(f"    bucket {b + 1}/{merge_buckets}   {total:,} pairs",
+                      end="\r")
     finally:
         if writer is not None:
             writer.close()
-    print()
+        tick.close()
+    if not progress.console_enabled():
+        print()
+    progress.note(
+        "features: written",
+        pairs=total,
+        positives=positives,
+        parquet_gb=round(dst.stat().st_size / 1_073_741_824, 3)
+        if dst.is_file() else None,
+        bytes_per_row=round(dst.stat().st_size / max(total, 1), 1)
+        if dst.is_file() else None,
+    )
 
     n_cand = pl.scan_parquet(cand_path).select(pl.len()).collect().item()
     if total != n_cand:
@@ -578,11 +611,15 @@ def main() -> None:
         "only, not the output. Must stay keyed on the source-1 ID — see "
         "_relative_features.",
     )
+    progress.add_arguments(p)
     a = p.parse_args()
     work = paths.work_root(a.work_root)
     data = paths.data_root(a.data_root)
+    progress.configure_from_args(a, work, label=f"features:{a.split}")
     print(f"features [{a.split}]  work={work}")
-    build_features(a.split, work, data, a.merge_buckets)
+    with progress.stage("features", buckets=a.merge_buckets):
+        build_features(a.split, work, data, a.merge_buckets)
+    progress.shutdown()
 
 
 if __name__ == "__main__":

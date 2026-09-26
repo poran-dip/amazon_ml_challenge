@@ -50,7 +50,7 @@ from pathlib import Path
 
 import polars as pl
 
-from . import minhash, paths
+from . import minhash, paths, progress
 
 # How many LSH band keys exist. FIXED at module level, deliberately, even
 # though `--bands` selects how many actually block.
@@ -353,7 +353,9 @@ def _target_table(
     # Bucket census first, on its own: it collects to one row per distinct key
     # value, which is small, and gives the "dropped" figure without holding the
     # full table and a join output at the same time.
-    sizes = sources.group_by("bk").len().collect()
+    with progress.stage(f"targets:{key}", cap=cap) as _census_st:
+        sizes = sources.group_by("bk").len().collect()
+        _census_st.set(rows=sizes.height)
     n_buckets = sizes.height
     n_dropped = int(sizes.filter(pl.col("len") > cap).height)
     keep_sizes = sizes.filter(pl.col("len") <= cap).with_columns(
@@ -367,7 +369,15 @@ def _target_table(
     # key, so at twenty-one keys it is twenty-one redundant groupings of the
     # whole target side. An inner join also applies the cap for free, since
     # over-cap buckets are already absent from `keep_sizes`.
-    kept = sources.join(keep_sizes.lazy(), on="bk", how="inner").collect()
+    with progress.stage(f"targets-join:{key}") as _join_st:
+        kept = sources.join(keep_sizes.lazy(), on="bk", how="inner").collect()
+        # The resident size of this table IS the memory shape the module
+        # docstring reasons about ("roughly 3-5GB at full scale"), and it has
+        # never been measured. Recorded per key so the claim can be checked.
+        _join_st.set(rows=kept.height,
+                     resident_mb=round(kept.estimated_size("mb"), 1),
+                     buckets_kept=n_buckets - n_dropped,
+                     buckets_dropped=n_dropped)
     note = f" (min len {min_len})" if min_len > 1 else ""
     print(
         f"    {key:<14} targets {kept.height:>12,} rows{note}   "
@@ -481,11 +491,16 @@ def _emit_key(
 
     written: list[Path] = []
     emitted = 0
+    bytes_written = 0
     # One writer open at a time. The alternative -- a writer per bucket held
     # open across one pass of source 1 -- would mean n_keys * n_buckets open
     # parquet writers and their buffers.
     bucket_of = (pl.col("source1_entity_id").hash() % n_buckets).alias("_b")
     s1 = s1.with_columns(bucket_of)
+    # `projected` is exact, so the ticker over EMITTED pairs has a real
+    # denominator rather than a bucket count -- which makes the ETA meaningful
+    # even though the buckets are unequal in size.
+    tick = progress.ticker(projected, unit="pairs", label=f"emit {key}")
     for b in range(n_buckets):
         block = s1.filter(pl.col("_b") == b).drop("_b")
         if block.is_empty():
@@ -525,12 +540,29 @@ def _emit_key(
                     writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
                 writer.write_table(table)
                 emitted += hits.height
+                tick.advance(hits.height, bucket=f"{b + 1}/{n_buckets}")
         finally:
             if writer is not None:
                 writer.close()
                 written.append(dst)
+                # After close(), so the footer is included. This is the number
+                # that answers "how many GB did blocking put on disk?" per key,
+                # which at 21 keys is the difference between a full disk and a
+                # finished run.
+                try:
+                    bytes_written += dst.stat().st_size
+                except OSError:
+                    pass
 
+    tick.close()
     del targets, s1
+    progress.note(
+        f"{key}: emitted",
+        pairs=emitted,
+        bucket_files=len(written),
+        parquet_mb=round(bytes_written / 1_048_576, 1),
+        running_total=total,
+    )
     if not written:
         print(f"    {key:<14} no candidates emitted")
         return []
@@ -567,9 +599,14 @@ def _merge(
     writer = None
     kept = 0
     raw = 0
+    # The merge is documented as the peak-memory step of the whole pipeline, and
+    # the per-bucket ticker is the only thing that shows the peak arriving
+    # rather than reporting it after the process has already been killed.
+    tick = progress.ticker(n_buckets, unit="buckets", label="merge")
     for b in range(n_buckets):
         here = partials_by_bucket.get(b, [])
         if not here:
+            tick.advance(1, raw=raw, kept=kept)
             continue
         # No filter. `_emit_key` already routed every row to its bucket's own
         # file, so this reads exactly the rows it needs and reads them once.
@@ -609,6 +646,7 @@ def _merge(
         )
         raw += grouped.height
         if grouped.is_empty():
+            tick.advance(1, raw=raw, kept=kept)
             continue
         # k-of-b LSH. Admitting a pair on ONE band agreement is the loosest
         # possible reading of the signature, and it is what makes the
@@ -626,6 +664,7 @@ def _merge(
                 (pl.col("n_exact") > 0) | (pl.col("n_bands") >= band_min_hits)
             )
             if grouped.is_empty():
+                tick.advance(1, raw=raw, kept=kept)
                 continue
         # Eager, deliberately. The sort must happen before the positional
         # filter, and a lazy optimizer is free to reorder them. Ties break on
@@ -657,10 +696,18 @@ def _merge(
             writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
         writer.write_table(table)
         kept += capped.height
-        print(f"    merge bucket {b + 1}/{n_buckets}   kept {kept:,}", end="\r")
+        tick.advance(1, raw=raw, kept=kept)
+        if not progress.console_enabled():
+            # The old line, kept for runs without --progress. The ticker
+            # replaces it otherwise; printing both would have two writers
+            # fighting over the same terminal line, which is exactly the
+            # unreadable output this change exists to remove.
+            print(f"    merge bucket {b + 1}/{n_buckets}   kept {kept:,}", end="\r")
     if writer is not None:
         writer.close()
-    print()
+    tick.close()
+    if not progress.console_enabled():
+        print()
     return raw, kept
 
 
@@ -1038,31 +1085,47 @@ def block_split(
     # Source 1 read ONCE, with every selected key column, instead of once per
     # key inside _emit_key. Two columns of 2.2M rows per key is cheap; twenty-
     # one reads of the parquet to get them is not.
-    s1_all = (
-        pl.scan_parquet(paths.normalized_parquet(split, 1, work))
-        .select("entity_id", "country_norm", *selected)
-        .collect()
-    )
+    with progress.stage("read-source1", keys=len(selected)) as st:
+        s1_all = (
+            pl.scan_parquet(paths.normalized_parquet(split, 1, work))
+            .select("entity_id", "country_norm", *selected)
+            .collect()
+        )
+        st.set(rows=s1_all.height,
+               resident_mb=round(s1_all.estimated_size("mb"), 1))
     print(f"  source1: {s1_all.height:,} rows resident "
           f"({s1_all.estimated_size('mb'):.0f} MB)")
 
     partials_by_bucket: dict[int, list[Path]] = {}
     running = [0]
-    for key, weight, cap in specs:
-        if key == "name_acronym":
-            cap = acronym_cap or cap
-            min_len = acronym_min_len
-        elif is_band(key):
-            cap = band_cap or cap
-            min_len = 0
-        else:
-            min_len = 0
-        for path in _emit_key(
-            split, work, key, weight, max_bucket or cap, chunk, s1_all,
-            merge_buckets, min_len, max_pairs, running, max_total,
-        ):
-            b = int(path.stem.rsplit("_b", 1)[1])
-            partials_by_bucket.setdefault(b, []).append(path)
+    # Keys are the unit of work here and there are up to twenty-one of them, so
+    # a single "emit" total says nothing about which one is expensive. One stage
+    # per key is what turns "blocking took 40 minutes" into an ordered list of
+    # what to cut -- and under the new rule that scores candidate-set size, the
+    # per-key pair count is the thing being traded off.
+    with progress.stage("emit", keys=len(specs)) as emit_st:
+        key_tick = emit_st.ticker(len(specs), unit="keys", label="keys")
+        for key, weight, cap in specs:
+            if key == "name_acronym":
+                cap = acronym_cap or cap
+                min_len = acronym_min_len
+            elif is_band(key):
+                cap = band_cap or cap
+                min_len = 0
+            else:
+                min_len = 0
+            with progress.stage(f"emit:{key}", cap=max_bucket or cap) as ks:
+                paths_out = _emit_key(
+                    split, work, key, weight, max_bucket or cap, chunk, s1_all,
+                    merge_buckets, min_len, max_pairs, running, max_total,
+                )
+                ks.set(files=len(paths_out), running_pairs=running[0])
+            for path in paths_out:
+                b = int(path.stem.rsplit("_b", 1)[1])
+                partials_by_bucket.setdefault(b, []).append(path)
+            key_tick.advance(1, pairs=running[0])
+        key_tick.close()
+        emit_st.set(rows=running[0])
     del s1_all
     if not partials_by_bucket:
         raise RuntimeError(
@@ -1071,8 +1134,31 @@ def block_split(
 
     dst = paths.candidates_parquet(split, work)
     print("  merging:")
-    raw, kept = _merge(partials_by_bucket, dst, budget, merge_buckets,
-                       band_min_hits)
+    with progress.stage("merge", budget=budget,
+                        band_min_hits=band_min_hits,
+                        buckets=merge_buckets) as merge_st:
+        raw, kept = _merge(partials_by_bucket, dst, budget, merge_buckets,
+                           band_min_hits)
+        merge_st.set(rows=kept, raw_pairs=raw,
+                     candidates_mb=round(dst.stat().st_size / 1_048_576, 1)
+                     if dst.is_file() else None)
+    # The partials are the pipeline's biggest transient disk cost and nothing
+    # reported it. Measured here rather than estimated: at 21 keys x 16 buckets
+    # this is hundreds of files.
+    partial_bytes = 0
+    n_partials = 0
+    for plist in partials_by_bucket.values():
+        for p_ in plist:
+            try:
+                partial_bytes += p_.stat().st_size
+                n_partials += 1
+            except OSError:
+                pass
+    progress.note("blocking: disk footprint",
+                  partial_files=n_partials,
+                  partials_gb=round(partial_bytes / 1_073_741_824, 3),
+                  candidates_gb=round(dst.stat().st_size / 1_073_741_824, 3)
+                  if dst.is_file() else None)
     elapsed = time.perf_counter() - started
     gate = f" and >={band_min_hits} band hits" if band_min_hits > 1 else ""
     print(
@@ -1181,9 +1267,11 @@ def main() -> None:
         help="Hash partitions for the merge. Affects peak memory only, not the "
         "output. Raise it if the merge is the step that runs out of memory.",
     )
+    progress.add_arguments(p)
     a = p.parse_args()
 
     work = paths.work_root(a.work_root)
+    progress.configure_from_args(a, work, label=f"blocking:{a.split}")
     if a.keys and a.bands is not None:
         p.error("pass --keys or --bands, not both.")
     keys = tuple(k.strip() for k in a.keys.split(",")) if a.keys else None
@@ -1212,12 +1300,15 @@ def main() -> None:
     print(f"  bucket caps: {caps}"
           + (f"   acronym min len: {a.acronym_min_len}"
              if a.acronym_min_len > 1 else ""))
-    block_split(
-        a.split, work, a.budget, a.max_bucket, a.chunk, a.merge_buckets, keys,
-        a.acronym_cap, a.acronym_min_len, a.bands if keys is None else None,
-        a.band_min_hits, a.band_cap, a.max_pairs_per_key or None,
-        a.max_pairs_total or None,
-    )
+    with progress.stage("blocking", split=a.split, budget=a.budget,
+                        exact_keys=len(exact_sel), bands=n_band_sel):
+        block_split(
+            a.split, work, a.budget, a.max_bucket, a.chunk, a.merge_buckets, keys,
+            a.acronym_cap, a.acronym_min_len, a.bands if keys is None else None,
+            a.band_min_hits, a.band_cap, a.max_pairs_per_key or None,
+            a.max_pairs_total or None,
+        )
+    progress.shutdown()
 
 
 # --------------------------------------------------------------------------

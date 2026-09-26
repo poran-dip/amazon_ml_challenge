@@ -62,7 +62,7 @@ from pathlib import Path
 
 import polars as pl
 
-from . import blocking, minhash, paths, text_norm, translit
+from . import blocking, minhash, paths, progress, text_norm, translit
 
 SOURCE_COLUMNS = paths.SOURCE_COLUMNS
 # A key shared by more records than this carries almost no evidence and would
@@ -420,8 +420,15 @@ _RULE_MODULES: tuple[str, ...] = (
 # to add the four files that mattered by hand, which is the same fix that would
 # have missed `minhash.py` today. A hand-maintained list of what matters fails
 # open; a list that must cover everything fails closed.
+#
+# `progress.py` belongs here by construction, not by inspection: it observes the
+# pipeline and writes only to stderr and `work/timings.jsonl`. It touches no
+# column that reaches the normalized parquet, and if it ever did, an
+# instrumentation change silently invalidating three minutes of normalization
+# would be the bug rather than the fix.
 _NOT_RULE_MODULES: tuple[str, ...] = (
     "__init__.py", "paths.py", "block_eval.py", "features.py", "model.py",
+    "progress.py", "timings.py",
 )
 
 
@@ -544,29 +551,45 @@ def ensure_normalized(
         if not force and _is_fresh(dst, src, expected, use_translit):
             shape = f"{expected:,} rows" if expected is not None else "row count unverified"
             print(f"  source{source}: reusing {dst.name} ({shape})")
+            progress.note(f"source{source}: normalization cache HIT",
+                          rows=expected, file=dst.name)
             continue
 
-        raw = scan_source(split, source, data, limit).collect()
-        writer = None
-        try:
-            for offset in range(0, max(raw.height, 1), chunk):
-                block = raw.slice(offset, chunk)
-                if block.is_empty():
-                    continue
-                table = prepare_full(block, use_translit).to_arrow()
-                # Stamp every chunk, not just the first: the writer is created
-                # from the first chunk's schema and pyarrow requires each
-                # subsequent table's schema to match it, metadata included.
-                table = table.replace_schema_metadata({
-                    POLARS_VERSION_KEY: pl.__version__.encode(),
-                    TRANSLIT_KEY: b"1" if use_translit else b"0",
-                })
-                if writer is None:
-                    writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
-                writer.write_table(table)
-        finally:
-            if writer is not None:
-                writer.close()
+        # One stage per source, because the three are very different sizes
+        # (source 1 is ~2.2M rows against ~10.3M across 2 and 3) and a single
+        # "normalize: 186s" number hides which of them the time went to.
+        with progress.stage(f"source{source}",
+                            rows_expected=expected or 0) as st:
+            raw = scan_source(split, source, data, limit).collect()
+            st.set(rows=raw.height)
+            tick = st.ticker(raw.height, unit="rows",
+                             label=f"source{source} normalize")
+            writer = None
+            try:
+                for offset in range(0, max(raw.height, 1), chunk):
+                    block = raw.slice(offset, chunk)
+                    if block.is_empty():
+                        continue
+                    table = prepare_full(block, use_translit).to_arrow()
+                    # Stamp every chunk, not just the first: the writer is
+                    # created from the first chunk's schema and pyarrow requires
+                    # each subsequent table's schema to match it, metadata
+                    # included.
+                    table = table.replace_schema_metadata({
+                        POLARS_VERSION_KEY: pl.__version__.encode(),
+                        TRANSLIT_KEY: b"1" if use_translit else b"0",
+                    })
+                    if writer is None:
+                        writer = pq.ParquetWriter(dst, table.schema,
+                                                  compression="zstd")
+                    writer.write_table(table)
+                    tick.advance(block.height)
+            finally:
+                if writer is not None:
+                    writer.close()
+                tick.close()
+            st.set(parquet_mb=round(dst.stat().st_size / 1_048_576, 1)
+                   if dst.is_file() else None)
         print(f"  source{source}: normalized {raw.height:,} rows -> {dst.name}")
         del raw
 
@@ -770,19 +793,23 @@ def generate_multi(
         print(f"  reusing {cand_path.name} (--reuse-candidates; "
               "not checked against --budget/--keys/--max-bucket)")
     else:
-        cand_path = blocking.block_split(
-            split, work, budget, max_bucket, chunk, merge_buckets, keys,
-            acronym_cap, acronym_min_len, bands, band_min_hits, band_cap,
-            max_pairs, max_total,
-            char_ngram=char_ngram,
-            ngram_n=ngram_n,
-            ngram_max_bucket=ngram_max_bucket,
-            prefix=prefix,
-            prefix_len=prefix_len,
-            prefix_max_bucket=prefix_max_bucket,
-            tfidf=tfidf,
-            tfidf_top_k=tfidf_top_k,
-        )
+        with progress.stage("blocking", budget=budget,
+                            band_min_hits=band_min_hits) as st:
+            cand_path = blocking.block_split(
+                split, work, budget, max_bucket, chunk, merge_buckets, keys,
+                acronym_cap, acronym_min_len, bands, band_min_hits, band_cap,
+                max_pairs, max_total,
+                char_ngram=char_ngram,
+                ngram_n=ngram_n,
+                ngram_max_bucket=ngram_max_bucket,
+                prefix=prefix,
+                prefix_len=prefix_len,
+                prefix_max_bucket=prefix_max_bucket,
+                tfidf=tfidf,
+                tfidf_top_k=tfidf_top_k,
+            )
+            st.set(candidates_mb=round(cand_path.stat().st_size / 1_048_576, 1)
+                   if cand_path.is_file() else None)
 
     # Address lookups, resident. Two narrow frames — IDs and one short string —
     # rather than the full normalized set.
@@ -799,8 +826,15 @@ def generate_multi(
             how="vertical",
         ).collect()
 
-    s1_addr = _addr((1,), "source1_entity_id", "addr")
-    tgt_addr = _addr((2, 3), "candidate_entity_id", "cand_addr")
+    with progress.stage("score/address-lookups") as st:
+        s1_addr = _addr((1,), "source1_entity_id", "addr")
+        tgt_addr = _addr((2, 3), "candidate_entity_id", "cand_addr")
+        # These two frames are resident for the whole scoring loop, so their
+        # size is a floor on the stage's memory and worth recording next to the
+        # peak rather than inferring from it.
+        st.set(rows=s1_addr.height + tgt_addr.height,
+               s1_mb=round(s1_addr.estimated_size("mb"), 1),
+               tgt_mb=round(tgt_addr.estimated_size("mb"), 1))
     print(f"  address lookups: {s1_addr.height:,} source-1, {tgt_addr.height:,} target")
 
     cand_parts, match_parts = [], []
@@ -808,40 +842,61 @@ def generate_multi(
     # entity, so entities are independent and a bucket can be scored in
     # isolation. This keeps the join output bounded instead of materializing
     # ~44M scored pairs at once.
-    for b in range(merge_buckets):
-        # Same fix as `features.build_features`: filter on the materialized
-        # `bucket` column when blocking wrote one, so parquet row-group
-        # statistics skip the rest of the file instead of this decoding the
-        # whole candidate set once per bucket.
-        chunk_df = (
-            pl.scan_parquet(cand_path)
-            .filter(
-                (pl.col("bucket") == b) if _has_bucket_col(cand_path)
-                else ((pl.col("source1_entity_id").hash() % merge_buckets) == b)
-            )
-            .collect()
-        )
-        if chunk_df.is_empty():
-            continue
-        scored = (
-            chunk_df.join(s1_addr, on="source1_entity_id", how="inner")
-            .join(tgt_addr, on="candidate_entity_id", how="inner")
-            .with_columns(_jaccard(pl.col("addr"), pl.col("cand_addr")).alias("sim"))
-        )
-        cand_parts.append(scored.select("source1_entity_id", "candidate_entity_id"))
-        match_parts.append(
-            scored.filter(pl.col("sim") >= threshold)
-            # Sort on the address score first, then fall back to the blocking
-            # evidence, then the id. Jaccard ties are common on short
-            # addresses, and an unbroken tie here picks survivors by row order.
-            .sort(
-                ["sim", "block_score", "n_keys", "candidate_entity_id"],
-                descending=[True, True, True, False],
-            )
-            .filter(pl.int_range(pl.len()).over("source1_entity_id") < topk)
-            .select("source1_entity_id", "candidate_entity_id")
-        )
-        print(f"  scoring bucket {b + 1}/{merge_buckets}", end="\r")
+    # `_has_bucket_col` opens the parquet footer, so it was doing that once per
+    # bucket inside the loop for an answer that cannot change. Hoisted while
+    # adding the ticker.
+    use_bucket_col = _has_bucket_col(cand_path)
+    with progress.stage("score/jaccard", buckets=merge_buckets) as score_st:
+        tick = score_st.ticker(merge_buckets, unit="buckets", label="scoring")
+        n_scored = 0
+        n_kept = 0
+        try:
+            for b in range(merge_buckets):
+                # Same fix as `features.build_features`: filter on the
+                # materialized `bucket` column when blocking wrote one, so
+                # parquet row-group statistics skip the rest of the file instead
+                # of this decoding the whole candidate set once per bucket.
+                chunk_df = (
+                    pl.scan_parquet(cand_path)
+                    .filter(
+                        (pl.col("bucket") == b) if use_bucket_col
+                        else ((pl.col("source1_entity_id").hash() % merge_buckets) == b)
+                    )
+                    .collect()
+                )
+                if chunk_df.is_empty():
+                    tick.advance(1, pairs=n_scored, kept=n_kept)
+                    continue
+                scored = (
+                    chunk_df.join(s1_addr, on="source1_entity_id", how="inner")
+                    .join(tgt_addr, on="candidate_entity_id", how="inner")
+                    .with_columns(
+                        _jaccard(pl.col("addr"), pl.col("cand_addr")).alias("sim")
+                    )
+                )
+                cand_parts.append(
+                    scored.select("source1_entity_id", "candidate_entity_id")
+                )
+                kept = (
+                    scored.filter(pl.col("sim") >= threshold)
+                    # Sort on the address score first, then fall back to the
+                    # blocking evidence, then the id. Jaccard ties are common on
+                    # short addresses, and an unbroken tie here picks survivors
+                    # by row order.
+                    .sort(
+                        ["sim", "block_score", "n_keys", "candidate_entity_id"],
+                        descending=[True, True, True, False],
+                    )
+                    .filter(pl.int_range(pl.len()).over("source1_entity_id") < topk)
+                    .select("source1_entity_id", "candidate_entity_id")
+                )
+                match_parts.append(kept)
+                n_scored += scored.height
+                n_kept += kept.height
+                tick.advance(1, pairs=n_scored, kept=n_kept)
+        finally:
+            tick.close()
+        score_st.set(rows=n_scored, kept=n_kept)
 
     empty = pl.DataFrame(
         schema={"source1_entity_id": pl.Utf8, "candidate_entity_id": pl.Utf8}
@@ -886,19 +941,28 @@ def generate_model(
         print(f"  reusing {cand_path.name} (--reuse-candidates; "
               "not checked against --budget/--keys/--max-bucket)")
     else:
-        blocking.block_split(
-            split, work, budget, max_bucket, chunk, merge_buckets, keys,
-            acronym_cap, acronym_min_len, bands, band_min_hits, band_cap,
-            max_pairs, max_total,
-        )
+        with progress.stage("blocking", budget=budget,
+                            band_min_hits=band_min_hits) as st:
+            blocking.block_split(
+                split, work, budget, max_bucket, chunk, merge_buckets, keys,
+                acronym_cap, acronym_min_len, bands, band_min_hits, band_cap,
+                max_pairs, max_total,
+            )
+            st.set(candidates_mb=round(cand_path.stat().st_size / 1_048_576, 1)
+                   if cand_path.is_file() else None)
 
     print("  features:")
-    feature_stage.build_features(split, work, data, merge_buckets)
+    with progress.stage("features") as st:
+        feat_path = feature_stage.build_features(split, work, data, merge_buckets)
+        if feat_path.is_file():
+            st.set(parquet_gb=round(feat_path.stat().st_size / 1_073_741_824, 3))
     print("  model:")
-    matches = model_stage.run(
-        split, work, topk, coverage, folds, train_entities, rounds, seed,
-        train_rows,
-    ).rename({"source1_entity_id": "entity_id"})
+    with progress.stage("model", folds=folds, rounds=rounds) as st:
+        matches = model_stage.run(
+            split, work, topk, coverage, folds, train_entities, rounds, seed,
+            train_rows,
+        ).rename({"source1_entity_id": "entity_id"})
+        st.set(rows=matches.height)
 
     # The candidate file is the deliverable for `candidate_pairs.tsv`, which is
     # a separate submission artefact from the matches and must list everything
@@ -941,7 +1005,12 @@ def write_submission(
         )
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    full.write_csv(out_path, separator="\t", include_header=True, quote_style="never")
+    with progress.stage(f"write/{out_path.name}") as st:
+        full.write_csv(out_path, separator="\t", include_header=True,
+                       quote_style="never")
+        st.set(rows=full.height,
+               tsv_mb=round(out_path.stat().st_size / 1_048_576, 1)
+               if out_path.is_file() else None)
     print(f"  wrote {full.height:,} rows -> {out_path}")
     return full
 
@@ -1226,11 +1295,15 @@ def main() -> None:
                         "is character-trigram similarity (0.000 -> 0.326 on "
                         "cross-script pairs), which only pays once a fuzzy "
                         "stage exists. Ignored with --legacy-norm.")
+    progress.add_arguments(p)
     a = p.parse_args()
 
     data = paths.data_root(a.data_root)
     out = paths.output_root(a.out_dir)
     work = paths.work_root(a.work_root)
+    # Before any work, so the run_start record and the first stage's baseline
+    # memory reading describe a process that has not yet loaded anything.
+    progress.configure_from_args(a, work, out, label=f"main:{a.split}")
 
     # Multi-key blocking reads the normalized parquet, which the legacy rules
     # do not produce — they emit one fused block key and nothing else. Rather
@@ -1282,10 +1355,13 @@ def main() -> None:
 
     if a.blocking == "multi":
         print("  normalizing:")
-        ensure_normalized(
-            a.split, data, work, a.translit and not a.legacy_norm, a.chunk,
-            a.force_normalize, a.sample, a.sample_targets,
-        )
+        with progress.stage("normalize", chunk=a.chunk,
+                            translit=bool(a.translit and not a.legacy_norm),
+                            forced=bool(a.force_normalize)):
+            ensure_normalized(
+                a.split, data, work, a.translit and not a.legacy_norm, a.chunk,
+                a.force_normalize, a.sample, a.sample_targets,
+            )
         if a.normalize_only:
             print(f"  done in {time.perf_counter() - started:.1f}s "
                   f"(--normalize-only; run `python -m src.blocking "
@@ -1334,9 +1410,14 @@ def main() -> None:
                              out / "matching_results.tsv", "matched_entity_ids")
 
     if a.split == "train":
-        score = macro_f05(preds, data, "matched_entity_ids")
+        with progress.stage("self-score") as st:
+            score = macro_f05(preds, data, "matched_entity_ids")
+            st.set(macro_f05=round(score, 6))
         print(f"\n  MACRO F_0.5 = {score:.4f}")
     print(f"  done in {time.perf_counter() - started:.1f}s")
+    # Explicit as well as atexit-registered, so the closing telemetry line lands
+    # before the shell prompt rather than after it.
+    progress.shutdown()
 
 
 if __name__ == "__main__":

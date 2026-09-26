@@ -49,7 +49,7 @@ from pathlib import Path
 
 import polars as pl
 
-from . import blocking, paths
+from . import blocking, paths, progress
 
 
 def ground_truth_pairs(path: Path) -> pl.LazyFrame:
@@ -622,10 +622,12 @@ def main() -> None:
     p.add_argument("--candidates", default=None,
                    help="Candidate parquet to score. Defaults to the stage A "
                         "output for this split.")
+    progress.add_arguments(p)
     a = p.parse_args()
 
     work = paths.work_root(a.work_root)
     data = paths.data_root(a.data_root)
+    progress.configure_from_args(a, work, label=f"block_eval:{a.split}")
 
     if a.split != "train":
         p.error("blocking can only be evaluated on train — there is no test "
@@ -645,16 +647,24 @@ def main() -> None:
             p.error(f"{cand_path} missing — run "
                     f"`python -m src.blocking --split {a.split}` first, or pass "
                     "--no-candidate-recall for the per-key numbers alone.")
-        candidate_recall(a.split, work, data, cand_path, a.budget)
+        with progress.stage("eval/candidate-recall", budget=a.budget):
+            candidate_recall(a.split, work, data, cand_path, a.budget)
         cuts = tuple(
             sorted({int(c) for c in a.budget_curve.split(",") if c.strip()})
         )
         if cuts:
-            budget_curve(a.split, work, data, cand_path, cuts)
+            with progress.stage("eval/budget-curve", cuts=len(cuts)):
+                budget_curve(a.split, work, data, cand_path, cuts)
 
     if not a.no_key_diagnostics:
-        key_diagnostics(a.split, work, data, a.max_bucket, a.sample_pairs,
-                    a.acronym_cap, a.band_cap)
+        # The per-key diagnostics rebuild every key's target table, so this
+        # section alone costs about as much as a blocking run. Timing it
+        # separately is what stops that being attributed to the evaluation of
+        # the candidate file.
+        with progress.stage("eval/key-diagnostics"):
+            key_diagnostics(a.split, work, data, a.max_bucket, a.sample_pairs,
+                        a.acronym_cap, a.band_cap)
+    progress.shutdown()
 
 
 if __name__ == "__main__":
