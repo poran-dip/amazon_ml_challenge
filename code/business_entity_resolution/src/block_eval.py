@@ -343,46 +343,82 @@ def key_diagnostics(
         return
     print(f"true pairs examined: {total:,}\n")
 
+    def _agrees(key: str) -> pl.Expr:
+        """Both sides present and equal.
+
+        The emptiness test is not cosmetic and is the same one `_usable`
+        makes: two records that both normalize to an empty name would
+        otherwise "agree" on every name key at once and be counted as reach
+        this stage does not have. For a band key the analogue is nullness — an
+        empty trigram list gives a null signature — and `str.len_chars()` on a
+        UInt64 raises rather than returning something wrong, which is how this
+        was found.
+        """
+        eq = (pl.col(key) == pl.col(f"{key}_r")) & pl.col(key).is_not_null()
+        if blocking.is_band(key):
+            return eq & pl.col(f"{key}_r").is_not_null()
+        return eq & (pl.col(key).str.len_chars() > 0)
+
     # Target-side bucket sizes, so a key that agrees can be told apart from one
     # that agrees AND would have survived the cap.
+    #
+    # Each key is reduced to TWO booleans and its inputs dropped before the
+    # next one is joined. That matters now in a way it did not at five keys:
+    # at twenty-one, holding every key's value for both sides plus every
+    # bucket size over 7.6M true pairs is several GB, and it would be spent at
+    # the end of a run that has already paid for blocking. The journal's
+    # "merge would have failed at the end of the longest job" entry is the same
+    # shape — peak memory in a step that runs last. Dropping as we go keeps
+    # this at 2 booleans per key regardless of how many keys there are.
     for key in keys:
         sizes = (
             others.select(blocking.blocking_key(key))
             .group_by("bk").len().collect()
         )
+        # Band signatures are UInt64 and `concat_str` will not take an integer
+        # column, so the right-hand value needs the same cast
+        # `blocking.blocking_key` applies on the left. Without it this joins
+        # nothing and every band reads as 0.00% usable — a diagnostic that
+        # fails silently in the direction of "the new keys do nothing", which
+        # is precisely the conclusion it would be used to draw.
+        value_r = pl.col(f"{key}_r")
+        if blocking.is_band(key):
+            value_r = value_r.cast(pl.Utf8)
         base = (
             base.with_columns(
                 pl.concat_str([
                     pl.col("country_norm_r").fill_null(""),
                     pl.lit("|"),
-                    pl.col(f"{key}_r"),
+                    value_r,
                 ]).alias("bk")
             )
             .join(sizes, on="bk", how="left")
             .rename({"len": f"_size_{key}"})
             .drop("bk")
+            .with_columns(_agrees(key).alias(f"_agree_{key}"))
+            .with_columns(
+                (
+                    pl.col(f"_agree_{key}")
+                    # A null size means the value was not in the target table
+                    # at all, which cannot happen for a pair whose right side
+                    # came from it — but fill defensively rather than letting a
+                    # null silently count as usable.
+                    & pl.col(f"_size_{key}").fill_null(10**9).le(caps[key])
+                ).alias(f"_usable_{key}")
+            )
+            # The two booleans are all that is read from here on, so the key's
+            # own columns and its bucket size go now rather than at the end.
+            .drop(f"_size_{key}", key, f"{key}_r")
         )
         del sizes
 
-    base = base.with_columns([
-        (
-            (pl.col(key) == pl.col(f"{key}_r"))
-            & pl.col(key).is_not_null()
-            & (pl.col(key).str.len_chars() > 0)
-        ).alias(f"_agree_{key}")
-        for key in keys
-    ])
-    base = base.with_columns([
-        (
-            pl.col(f"_agree_{key}")
-            # A null size means the value was not in the target table at all,
-            # which cannot happen for a pair whose right side came from it —
-            # but fill defensively rather than letting a null silently count
-            # as usable.
-            & pl.col(f"_size_{key}").fill_null(10**9).le(caps[key])
-        ).alias(f"_usable_{key}")
-        for key in keys
-    ])
+    def _any(cols: list[str]) -> int:
+        if not cols:
+            return 0
+        return int(base.select(pl.any_horizontal([pl.col(c) for c in cols]).sum()).item())
+
+    exact = [k for k in keys if not blocking.is_band(k)]
+    bands = [k for k in keys if blocking.is_band(k)]
 
     print(f"{'key':<14} {'agrees':>9} {'usable':>9} {'cap cost':>9} {'unique':>9}")
     for key in keys:
@@ -396,19 +432,45 @@ def key_diagnostics(
         )
         print(f"{key:<14} {agree / total:>8.2%} {usable / total:>8.2%} "
               f"{(agree - usable) / total:>8.2%} {unique / total:>8.2%}")
+        # A per-band "unique" is nearly always ~0 and says nothing: the bands
+        # are deliberately redundant with EACH OTHER, since a similar pair is
+        # meant to agree on several. The number that matters is what the bands
+        # add as a GROUP, printed below. Without this note the sixteen zeroes
+        # read as "the bands contribute nothing", which is the same misreading
+        # the budget curve's guaranteed-flat rows produced in session 4.
 
-    union = int(base.select(
-        pl.any_horizontal([pl.col(f"_usable_{k}") for k in keys]).sum()
-    ).item())
-    uncapped = int(base.select(
-        pl.any_horizontal([pl.col(f"_agree_{k}") for k in keys]).sum()
-    ).item())
+    union = _any([f"_usable_{k}" for k in keys])
+    uncapped = _any([f"_agree_{k}" for k in keys])
+    ex_union = _any([f"_usable_{k}" for k in exact])
+    bd_union = _any([f"_usable_{k}" for k in bands])
+    # What each group reaches that the OTHER group does not. This is the pair
+    # of numbers the fuzzy stage lives or dies by, and neither is visible in
+    # the per-key table above.
+    ex_only = int(base.select((
+        pl.any_horizontal([pl.col(f"_usable_{k}") for k in exact])
+        & ~pl.any_horizontal([pl.col(f"_usable_{k}") for k in bands])
+    ).sum()).item()) if exact and bands else 0
+    bd_only = int(base.select((
+        pl.any_horizontal([pl.col(f"_usable_{k}") for k in bands])
+        & ~pl.any_horizontal([pl.col(f"_usable_{k}") for k in exact])
+    ).sum()).item()) if exact and bands else 0
+
     print(f"\nUNION (what stage A can reach) : {union / total:.2%}")
     print(f"UNION if buckets were unlimited: {uncapped / total:.2%}")
     print(f"  -> the bucket cap costs        {(uncapped - union) / total:.2%} "
           "of all true pairs")
-    print(f"UNREACHABLE by any exact key   : {1 - uncapped / total:.2%} "
-          "<- needs fuzzy matching; no rule, weight or cap change touches it")
+    if bands:
+        print(f"\n  exact keys alone    : {ex_union / total:>7.2%}   "
+              "<- the ceiling every number in findings.md was measured against")
+        print(f"  LSH bands alone     : {bd_union / total:>7.2%}")
+        print(f"  bands add uniquely  : {bd_only / total:>7.2%}   "
+              "<- true pairs NO exact key reaches at any cap")
+        print(f"  exact adds uniquely : {ex_only / total:>7.2%}   "
+              "<- why the exact keys stay")
+        print(f"\nUNREACHABLE by ANY key         : {1 - uncapped / total:.2%}")
+    else:
+        print(f"UNREACHABLE by any exact key   : {1 - uncapped / total:.2%} "
+              "<- needs fuzzy matching; run without --bands 0")
 
 
 def main() -> None:
