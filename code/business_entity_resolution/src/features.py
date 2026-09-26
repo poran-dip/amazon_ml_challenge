@@ -87,7 +87,7 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     # provenance
     "block_score", "n_keys",
     *(f"hit_{k}" for k in blocking.KEY_COLUMNS),
-    "addr_only",
+    "addr_only", "n_band_hits",
     # name evidence
     "name_tri_jac", "name_tri_cont",
     "name_tok_jac", "name_tok_cont",
@@ -303,6 +303,23 @@ def _pair_features(df: pl.DataFrame) -> pl.DataFrame:
                 ) == 0
             )
         ).cast(pl.UInt8).alias("addr_only"),
+
+        # How many LSH bands found this pair. This is not redundant with the
+        # individual `hit_band_*` flags: the bands are exchangeable, so which
+        # ones agreed carries no information and only the COUNT does — and a
+        # tree would need sixteen splits to reconstruct a sum it can otherwise
+        # read in one.
+        #
+        # It is also the most directly useful number the fuzzy stage produces.
+        # P[a band agrees] is exactly the trigram Jaccard raised to `rows`, so
+        # the count is an unbiased estimator of similarity, measured at
+        # corr(n_bands, J) = 0.90. `name_tri_jac` computes that Jaccard
+        # exactly, so the two overlap — but this one is defined for pairs the
+        # trigram lists disagree about in ways Jaccard flattens, and it costs
+        # one column.
+        pl.sum_horizontal(
+            [pl.col(f"hit_{k}") for k in blocking.BAND_KEYS]
+        ).cast(pl.Float32).alias("n_band_hits"),
 
         # ---- name evidence ------------------------------------------------
         *_jaccard_and_containment("tri_e", "tri_c", "name_tri_jac", "name_tri_cont"),

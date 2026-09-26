@@ -183,6 +183,21 @@ assert len(set(KEY_COLUMNS)) == len(KEY_COLUMNS), (
 )
 KEY_BITS: dict[str, int] = {k: 1 << i for i, k in enumerate(KEY_COLUMNS)}
 
+# Lowest key_mask bit belonging to a band. Bands are appended last in
+# KEY_SPECS, so every band bit is at or above this and every exact-key bit is
+# below it. That contiguity is what lets `_merge` count band agreements with a
+# comparison on the bit VALUE instead of a popcount, which polars has no
+# expression for.
+BAND_BIT_FLOOR: int = min(
+    (KEY_BITS[k] for k in BAND_KEYS), default=1 << len(KEY_COLUMNS)
+)
+assert all(KEY_BITS[k] < BAND_BIT_FLOOR for k in EXACT_KEYS), (
+    "an exact key has a bit at or above BAND_BIT_FLOOR — the band bits are no "
+    "longer contiguous at the top, and --band-min-hits would miscount. Append "
+    "new exact keys BEFORE the bands in KEY_SPECS, or replace the comparison "
+    "in _merge with a real popcount."
+)
+
 # `name_core` is measured redundant and is excluded from blocking by default.
 # It contributed 0.00% unique true pairs under the superseded normalization AND
 # 0.00% again under the current one — two independent measurements, so this is
@@ -407,7 +422,8 @@ def _emit_key(
 # --------------------------------------------------------------------------
 
 def _merge(
-    partials: list[Path], dst: Path, budget: int, n_buckets: int
+    partials: list[Path], dst: Path, budget: int, n_buckets: int,
+    band_min_hits: int = 1,
 ) -> tuple[int, int]:
     """Combine every key's hits, score, and keep the best `budget` per entity.
 
@@ -447,12 +463,37 @@ def _merge(
                 # under a repeated emission rather than only in the happy case.
                 pl.col("key_bit").unique().sum().cast(KEY_MASK_DTYPE)
                 .alias("key_mask"),
+                # How many DISTINCT bands found this pair, and whether any
+                # exact key did. Both are counted off the bit value, which
+                # works because the band bits are contiguous at the top (see
+                # BAND_BIT_FLOOR).
+                pl.col("key_bit").filter(pl.col("key_bit") >= BAND_BIT_FLOOR)
+                .n_unique().cast(pl.UInt8).alias("n_bands"),
+                pl.col("key_bit").filter(pl.col("key_bit") < BAND_BIT_FLOOR)
+                .n_unique().cast(pl.UInt8).alias("n_exact"),
             )
             .collect()
         )
         raw += grouped.height
         if grouped.is_empty():
             continue
+        # k-of-b LSH. Admitting a pair on ONE band agreement is the loosest
+        # possible reading of the signature, and it is what makes the
+        # candidate set large: at trigram J=0.3 a single band agrees 35.5% of
+        # the time, so weak pairs arrive in bulk. Requiring k agreements is
+        # the same LSH curve at a much sharper threshold — at k=2, J=0.3
+        # falls to 6.8% while J=0.7 stays at 98.9%.
+        #
+        # This applies ONLY to pairs no exact key found. A pair with exact-key
+        # evidence is admitted on that evidence regardless of its bands, so
+        # raising k can never drop below the exact-key candidate set and
+        # `--bands 0` stays reproducible.
+        if band_min_hits > 1:
+            grouped = grouped.filter(
+                (pl.col("n_exact") > 0) | (pl.col("n_bands") >= band_min_hits)
+            )
+            if grouped.is_empty():
+                continue
         # Eager, deliberately. The sort must happen before the positional
         # filter, and a lazy optimizer is free to reorder them. Ties break on
         # evidence (more keys agreeing) and then on candidate id, so the
@@ -461,7 +502,14 @@ def _merge(
         capped = grouped.sort(
             ["block_score", "n_keys", "candidate_entity_id"],
             descending=[True, True, False],
-        ).filter(pl.int_range(pl.len()).over("source1_entity_id") < budget)
+        ).filter(
+            pl.int_range(pl.len()).over("source1_entity_id") < budget
+        # `n_bands`/`n_exact` were working columns for the filter above and are
+        # NOT written. Both are recoverable downstream from `key_mask`, which
+        # is already carried, and `features.py` reconstructs the band count by
+        # summing its own `hit_band_*` flags. Writing them would add 2 bytes to
+        # every one of ~47M rows to store something already present.
+        ).drop("n_bands", "n_exact")
         table = capped.to_arrow()
         if writer is None:
             writer = pq.ParquetWriter(dst, table.schema, compression="zstd")
@@ -750,6 +798,7 @@ def block_split(
     acronym_cap: int | None = None,
     acronym_min_len: int = 0,
     bands: int | None = None,
+    band_min_hits: int = 1,
     char_ngram: bool = False,
     ngram_n: int = 5,
     ngram_max_bucket: int = 200,
@@ -840,11 +889,13 @@ def block_split(
 
     dst = paths.candidates_parquet(split, work)
     print("  merging:")
-    raw, kept = _merge(partials, dst, budget, merge_buckets)
+    raw, kept = _merge(partials, dst, budget, merge_buckets, band_min_hits)
     elapsed = time.perf_counter() - started
+    gate = f" and >={band_min_hits} band hits" if band_min_hits > 1 else ""
     print(
-        f"  {raw:,} distinct pairs -> {kept:,} after budget {budget} "
-        f"-> {dst.name} ({elapsed:.1f}s)"
+        f"  {raw:,} distinct pairs -> {kept:,} after budget {budget}{gate} "
+        f"-> {dst.name} ({elapsed:.1f}s)   "
+        f"mean {kept / max(raw, 1) * 100:.1f}% kept"
     )
     return dst
 
@@ -886,6 +937,16 @@ def main() -> None:
         "to this stage rather than bisected. The bands are NESTED — band k is "
         "the same permutation group at every setting — so a curve over this "
         "reads off one normalization pass. Mutually exclusive with --keys.",
+    )
+    p.add_argument(
+        "--band-min-hits", type=int, default=1,
+        help="How many LSH bands must agree before a pair with NO exact-key "
+        "evidence is admitted (default: %(default)s). This is the "
+        "candidate-set-size knob. At rows=3, one band agrees on a trigram "
+        "Jaccard of 0.3 about 35%% of the time, so k=1 admits weak pairs in "
+        "bulk; k=2 drops that to 6.8%% while leaving J=0.7 at 98.9%%. Pairs an "
+        "exact key found are never filtered, so this can only shrink the "
+        "fuzzy half and --bands 0 is unaffected.",
     )
     p.add_argument(
         "--acronym-cap", type=int, default=None,
@@ -943,6 +1004,7 @@ def main() -> None:
     block_split(
         a.split, work, a.budget, a.max_bucket, a.chunk, a.merge_buckets, keys,
         a.acronym_cap, a.acronym_min_len, a.bands if keys is None else None,
+        a.band_min_hits,
     )
 
 

@@ -687,7 +687,7 @@ def generate_multi(
     budget: int, max_bucket: int | None, chunk: int, merge_buckets: int,
     keys: tuple[str, ...] | None, reuse_candidates: bool = False,
     acronym_cap: int | None = None, acronym_min_len: int = 0,
-    bands: int | None = None,
+    bands: int | None = None, band_min_hits: int = 1,
     char_ngram: bool = False,
     ngram_n: int = 5,
     ngram_max_bucket: int = 200,
@@ -726,7 +726,7 @@ def generate_multi(
     else:
         cand_path = blocking.block_split(
             split, work, budget, max_bucket, chunk, merge_buckets, keys,
-            acronym_cap, acronym_min_len, bands,
+            acronym_cap, acronym_min_len, bands, band_min_hits,
             char_ngram=char_ngram,
             ngram_n=ngram_n,
             ngram_max_bucket=ngram_max_bucket,
@@ -805,7 +805,7 @@ def generate_model(
     max_bucket: int | None, chunk: int, merge_buckets: int,
     keys: tuple[str, ...] | None, reuse_candidates: bool,
     acronym_cap: int | None, acronym_min_len: int, bands: int | None,
-    coverage: float, folds: int, train_entities: int | None,
+    band_min_hits: int, coverage: float, folds: int, train_entities: int | None,
     rounds: int, seed: int,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Multi-key blocking, then features, then the learned scorer.
@@ -833,7 +833,7 @@ def generate_model(
     else:
         blocking.block_split(
             split, work, budget, max_bucket, chunk, merge_buckets, keys,
-            acronym_cap, acronym_min_len, bands,
+            acronym_cap, acronym_min_len, bands, band_min_hits,
         )
 
     print("  features:")
@@ -1045,6 +1045,12 @@ def main() -> None:
                         "reference run this change has to be measured "
                         "against. Bands are nested, so a curve over this needs "
                         "no re-normalization. See src.minhash.")
+    p.add_argument("--band-min-hits", type=int, default=1,
+                   help="How many LSH bands must agree before a pair with no "
+                        "exact-key evidence becomes a candidate. The "
+                        "candidate-set-SIZE knob: raising it shrinks the fuzzy "
+                        "half sharply while barely touching high-similarity "
+                        "pairs. See src.blocking.")
     p.add_argument("--acronym-cap", type=int, default=None,
                    help="Bucket cap for name_acronym alone. See src.blocking.")
     p.add_argument("--acronym-min-len", type=int, default=0,
@@ -1209,7 +1215,7 @@ def main() -> None:
                 a.split, data, work, a.topk, a.budget, a.max_bucket, a.chunk,
                 a.merge_buckets, keys, a.reuse_candidates, a.acronym_cap,
                 a.acronym_min_len, a.bands if keys is None else None,
-                a.coverage, a.folds,
+                a.band_min_hits, a.coverage, a.folds,
                 a.train_entities or None, a.rounds, a.seed,
             )
         else:
@@ -1217,7 +1223,7 @@ def main() -> None:
                 a.split, data, work, a.topk, a.threshold, a.budget,
                 a.max_bucket, a.chunk, a.merge_buckets, keys,
                 a.reuse_candidates, a.acronym_cap, a.acronym_min_len,
-                a.bands if keys is None else None,
+                a.bands if keys is None else None, a.band_min_hits,
                 char_ngram=a.char_ngram,
                 ngram_n=a.ngram_n,
                 ngram_max_bucket=a.ngram_max_bucket,

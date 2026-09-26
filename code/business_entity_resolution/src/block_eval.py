@@ -143,7 +143,32 @@ def candidate_recall(
     # Entities blocking produced nothing for do not appear in `sizes` at all,
     # so they have to be counted by difference rather than filtered for.
     no_candidates = s1_total - sizes.height
-    under = int((sizes["n"] < budget).sum()) + no_candidates
+
+    # The cap is READ OFF THE FILE, not taken from the flag.
+    #
+    # `--budget` here defaulted to 20 and was used as the threshold whatever
+    # the file was actually built at, so evaluating a budget-60 file without
+    # repeating the flag printed "entities under budget (20): 66.39%" and
+    # labelled it "headroom a fuzzy stage could fill". Both halves are wrong:
+    # the threshold is not the file's cap, and being under it is not headroom.
+    # It invites "the budget is not binding", which is the session-4 failure
+    # verbatim, from a different direction.
+    #
+    # No entity can hold more candidates than the budget blocking ran at, so
+    # the largest per-entity count IS that budget (on any split with at least
+    # one saturated entity, which is every real run so far).
+    observed = int(sizes["n"].max()) if sizes.height else 0
+    at_cap = int((sizes["n"] == observed).sum()) if observed else 0
+    # What those entities are missing is the upper bound on everything a
+    # larger budget can recover — the number session 4 said should be read and
+    # that this function never actually computed.
+    capped_ids = sizes.filter(pl.col("n") == observed).select("source1_entity_id")
+    missed_at_cap = int(
+        per_entity.join(capped_ids, on="source1_entity_id", how="inner")
+        .select((pl.col("n_true") - pl.col("n_found")).sum())
+        .item() or 0
+    ) if observed else 0
+    under = int((sizes["n"] < observed).sum()) + no_candidates
 
     _section(f"candidate set [{split}] — {cand_path.name}")
     print(f"true pairs                  : {n_true:,}")
@@ -159,8 +184,19 @@ def candidate_recall(
     print(f"candidate pairs emitted     : {total_cand:,}")
     print(f"mean candidates per entity  : {total_cand / max(s1_total, 1):.2f}")
     print(f"entities with no candidates : {no_candidates:,}")
-    print(f"entities under budget ({budget})  : {under:,} "
-          f"({under / max(s1_total, 1):.2%})  <- headroom a fuzzy stage could fill")
+    if budget != observed:
+        print(f"  NOTE: --budget said {budget}, but this file's largest entity "
+              f"holds {observed}. Reporting against {observed}, which is what "
+              "blocking actually ran at.")
+    print(f"entities AT the cap ({observed})     : {at_cap:,} "
+          f"({at_cap / max(s1_total, 1):.2%})  <- only these can lose a true "
+          "match to the budget")
+    print(f"  true matches they are missing : {missed_at_cap:,} "
+          f"({missed_at_cap / max(n_true, 1):.2%} of all true pairs)  <- the "
+          "MOST a larger budget can recover")
+    print(f"entities below the cap      : {under:,} "
+          f"({under / max(s1_total, 1):.2%})  <- a larger budget cannot help "
+          "these; only more keys can")
     full_cross = s1_total * targets
     if full_cross:
         print(f"reduction ratio             : {1 - total_cand / full_cross:.8f} "
