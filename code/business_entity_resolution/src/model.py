@@ -324,6 +324,7 @@ def train_cv(
     rounds: int,
     seed: int,
     params: dict | None = None,
+    train_rows: int | None = None,
 ) -> tuple[list, pl.DataFrame]:
     """Grouped k-fold over source-1 entities. Returns (boosters, OOF scores).
 
@@ -349,6 +350,27 @@ def train_cv(
     print(f"  {n_ents:,} entities across {n_folds} folds: "
           + ", ".join(f"{r['entities']:,}" for r in sizes.iter_rows(named=True)))
 
+    # `--train-entities` is denominated in ENTITIES and the memory it controls
+    # is in ROWS, and the conversion between them is not a constant. It was
+    # 10.9 rows per entity when the default of 500,000 was chosen, giving a
+    # 5.4M-row training set. With the LSH bands it is 56.4, so the same flag
+    # asks for 28.2M rows — a ~6.8GB frame plus a ~5.5GB float32 copy, which
+    # does not fit beside a LightGBM Dataset in 16GB.
+    #
+    # So the flag is now capped by a ROW budget measured from the actual file.
+    # A default expressed in entities cannot survive a change to the candidate
+    # set; one expressed in rows can.
+    n_pair_rows = pl.scan_parquet(src).select(pl.len()).collect().item()
+    per_entity = n_pair_rows / max(n_ents, 1)
+    if train_rows:
+        by_rows = max(1, int(train_rows / max(per_entity, 1e-9)))
+        chosen = by_rows if not train_entities else min(train_entities, by_rows)
+        if chosen < (train_entities or by_rows):
+            print(f"  {per_entity:.1f} rows/entity -> capping training at "
+                  f"{chosen:,} entities (~{chosen * per_entity / 1e6:.1f}M rows) "
+                  f"to stay inside --train-rows {train_rows:,}")
+        train_entities = chosen
+
     def rows_for(keep: pl.DataFrame) -> pl.DataFrame:
         """Load exactly the pairs belonging to a set of entities."""
         return (
@@ -371,6 +393,12 @@ def train_cv(
             )
         if train_entities:
             fit_ents = fit_ents.sort("_pick").head(train_entities)
+        # The early-stopping slice is 1/20 of the training folds and was also
+        # unbounded — 88k entities, 5M rows, another ~2.2GB. It only has to be
+        # large enough to detect overfitting, so it gets a quarter of the
+        # training budget.
+        if train_entities:
+            early_ents = early_ents.sort("_pick").head(max(train_entities // 4, 1))
 
         fit = rows_for(fit_ents)
         early = rows_for(early_ents)
@@ -390,18 +418,11 @@ def train_cv(
         n_fit, n_fit_ents = fit.height, fit_ents.height
         del fit, early, dtrain, dvalid
 
-        hold = rows_for(plan.filter(pl.col("_fold") == f))
-        oof_parts.append(
-            hold.select(ENT, CAND).with_columns(
-                pl.Series(
-                    "p",
-                    booster.predict(_matrix(hold), num_iteration=booster.best_iteration),
-                    dtype=pl.Float32,
-                )
-            )
+        scored_fold, n_hold = predict_subset(
+            booster, src, plan.filter(pl.col("_fold") == f)
         )
-        n_hold = hold.height
-        del hold
+        oof_parts.append(scored_fold)
+        del scored_fold
 
         ap = next(iter(booster.best_score.get("early", {}).values()), float("nan"))
         print(
@@ -411,6 +432,44 @@ def train_cv(
         )
 
     return boosters, pl.concat(oof_parts, how="vertical")
+
+
+def predict_subset(
+    booster, src: Path, keep: pl.DataFrame, chunk: int = 2_000_000
+) -> tuple[pl.DataFrame, int]:
+    """Score one fold's held-out entities, streamed.
+
+    This used to be `rows_for(hold)` followed by `_matrix(hold)`, which
+    materialized every held-out row and then a second float32 copy of it.
+    Nothing bounded that. `--train-entities` caps the TRAINING set and says
+    nothing about the held-out set, which is `n_entities / n_folds` by
+    definition — 441,507 entities at five folds.
+
+    That was survivable when the feature table held 10.9 rows per entity and
+    fatal at 56.4: 24.9M rows is a ~6GB frame plus a ~4.9GB matrix, ~11GB at
+    once, on a 16GB machine that is also holding a booster. The same
+    `iter_batches` cursor `predict_ensemble` already uses keeps it to one
+    batch, and the semi-join per batch is cheap because the key set is small.
+    """
+    import pyarrow.parquet as pq
+
+    ids = keep.select(ENT)
+    pf = pq.ParquetFile(src)
+    parts: list[pl.DataFrame] = []
+    n = 0
+    for batch in pf.iter_batches(batch_size=chunk):
+        block = pl.from_arrow(batch).join(ids, on=ENT, how="semi")
+        if block.is_empty():
+            continue
+        p = booster.predict(_matrix(block), num_iteration=booster.best_iteration)
+        parts.append(
+            block.select(ENT, CAND).with_columns(pl.Series("p", p, dtype=pl.Float32))
+        )
+        n += block.height
+        del block
+    if not parts:
+        return pl.DataFrame(schema={ENT: pl.Utf8, CAND: pl.Utf8, "p": pl.Float32}), 0
+    return pl.concat(parts, how="vertical"), n
 
 
 def predict_ensemble(
@@ -540,6 +599,7 @@ def run(
     train_entities: int | None,
     rounds: int,
     seed: int,
+    train_rows: int | None = None,
 ) -> pl.DataFrame:
     """Train (train split) or load (test split), then predict and select."""
     src = paths.features_parquet(split, work)
@@ -561,7 +621,9 @@ def run(
                 f"{src} has no `label` column. Rebuild it with "
                 "`python -m src.features --split train`."
             )
-        boosters, scored = train_cv(src, n_folds, train_entities, rounds, seed)
+        boosters, scored = train_cv(
+            src, n_folds, train_entities, rounds, seed, train_rows=train_rows
+        )
         save_models(boosters, work, DEFAULT_PARAMS)
         report_importance(boosters)
     else:
@@ -599,6 +661,14 @@ def main() -> None:
                         "Entities, never rows — a partly sampled candidate "
                         "list makes the relative features describe a list that "
                         "never existed. 0 uses everything.")
+    p.add_argument("--train-rows", type=int, default=6_000_000,
+                   help="Row budget per fold's training set (default: "
+                        "%(default)s). Caps --train-entities using the "
+                        "measured rows-per-entity of the actual feature "
+                        "table. This is the knob that matters: the entity "
+                        "count controls memory only via rows/entity, which "
+                        "went from 10.9 to 56.4 when the LSH bands landed. "
+                        "0 disables the cap.")
     p.add_argument("--rounds", type=int, default=600,
                    help="Boosting round ceiling. Early stopping on an inner "
                         "slice of the training folds usually stops first.")
@@ -613,7 +683,7 @@ def main() -> None:
 
     pairs = run(
         a.split, work, a.topk, a.coverage, a.folds,
-        a.train_entities or None, a.rounds, a.seed,
+        a.train_entities or None, a.rounds, a.seed, a.train_rows or None,
     )
 
     # Imported here, not at module scope. `main` reaches into this module for

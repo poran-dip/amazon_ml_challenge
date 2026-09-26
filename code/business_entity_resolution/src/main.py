@@ -861,7 +861,7 @@ def generate_model(
     acronym_cap: int | None, acronym_min_len: int, bands: int | None,
     band_min_hits: int, band_cap: int | None, max_pairs: int | None,
     max_total: int | None, coverage: float, folds: int, train_entities: int | None,
-    rounds: int, seed: int,
+    rounds: int, seed: int, train_rows: int | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Multi-key blocking, then features, then the learned scorer.
 
@@ -896,7 +896,8 @@ def generate_model(
     feature_stage.build_features(split, work, data, merge_buckets)
     print("  model:")
     matches = model_stage.run(
-        split, work, topk, coverage, folds, train_entities, rounds, seed
+        split, work, topk, coverage, folds, train_entities, rounds, seed,
+        train_rows,
     ).rename({"source1_entity_id": "entity_id"})
 
     # The candidate file is the deliverable for `candidate_pairs.tsv`, which is
@@ -1151,6 +1152,14 @@ def main() -> None:
     p.add_argument("--train-entities", type=int, default=500_000,
                    help="--scorer model only. Entities sampled per fold for "
                         "training. 0 uses all of them.")
+    p.add_argument("--train-rows", type=int, default=6_000_000,
+                   help="--scorer model only. Row budget per fold's training "
+                        "set, which caps --train-entities using the measured "
+                        "rows-per-entity of the feature table. The entity "
+                        "count controls memory only through that ratio, and "
+                        "it went from 10.9 to 56.4 when the LSH bands landed, "
+                        "so a default in entities does not survive a change to "
+                        "the candidate set. 0 disables. See src.model.")
     p.add_argument("--rounds", type=int, default=600,
                    help="--scorer model only. Boosting round ceiling; early "
                         "stopping on an inner slice usually stops first.")
@@ -1291,6 +1300,7 @@ def main() -> None:
                 a.band_min_hits, a.band_cap, a.max_pairs_per_key or None,
                 a.max_pairs_total or None, a.coverage, a.folds,
                 a.train_entities or None, a.rounds, a.seed,
+                a.train_rows or None,
             )
         else:
             cands, matches = generate_multi(
