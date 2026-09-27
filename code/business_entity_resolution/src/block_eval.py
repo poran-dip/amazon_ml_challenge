@@ -6,7 +6,7 @@ this is the number to move before any of those are worth touching, and the
 per-key diagnostics are what make a blocking change judgeable rather than a
 guess.
 
-Two sections, and they answer different questions.
+Three sections, and they answer different questions.
 
 **Candidate-set recall** scores the file blocking actually wrote. It is the
 real ceiling, after bucket caps and after the per-entity budget.
@@ -36,10 +36,46 @@ pairs instead of ~44M candidates, so it is much cheaper.
     contribution, while `name_core` agreed on half of all true pairs and
     contributed nothing at all.
 
+**Missed pairs** starts from the true pairs that are NOT in the candidate set
+and attributes each one to the stage that lost it, which the other two
+sections cannot do: the first says how many were lost, the second says what
+each key reaches against the true pairs rather than against the emitted file.
+A pair can be `usable` there and still be absent here, evicted by the budget.
+
+  * *country-mismatch* — every key is `<country>|value`, so no key can fire.
+  * *no-key-agrees* — every key disagrees. Only a NEW key helps, and the
+    similarity breakdown under it says which kind: a miss at high trigram
+    Jaccard is one the LSH bands are supposed to reach, a miss at high
+    containment wants a prefix or containment key, and a miss at J < 0.2
+    shares almost no characters with its match at all.
+  * *bucket-cap* — a key agreed and its target bucket was over cap.
+  * *band-gate* — band-only evidence, below `--band-min-hits`.
+  * *budget-evicted* — generated, ranked, and cut by `--budget`.
+  * *unexplained* — reachable, for an entity that never filled its budget.
+    Nothing in blocking drops those, so a non-zero count means the flags
+    passed here are not the ones that built the candidate file. It is printed
+    loudly rather than folded into `budget-evicted`, where it would look like
+    a reason to raise the budget.
+
+It then prints `--show-misses` of them in full — by default the
+`no-key-agrees` ones, since every other reason is already actionable from the
+table and that one is not. Each shows the raw AND normalized name and address
+of both sides, the trigram Jaccard and containment, and what blocking returned
+for that entity instead. `--miss-reason` picks a different bucket.
+
 Usage:
 
     python -m src.block_eval --split train
     python -m src.block_eval --split train --no-key-diagnostics
+
+    # the flags BLOCKING ran with have to be repeated, or the attribution
+    # describes a run that never happened
+    python -m src.block_eval --split train --budget 60 --band-cap 100 \
+        --band-min-hits 2 --show-misses 20
+
+    # the near-misses alone, or a different bucket
+    python -m src.block_eval --split train --miss-order most-similar
+    python -m src.block_eval --split train --miss-reason bucket-cap
 """
 
 from __future__ import annotations
@@ -425,19 +461,16 @@ def budget_curve(
         print("  SCORED quantity: a smaller candidate set per entity ranks higher.")
 
 
-def key_diagnostics(
-    split: str, work: Path, data: Path, max_bucket: int | None,
-    sample_pairs: int | None, acronym_cap: int | None = None,
-    band_cap: int | None = None,
-) -> None:
-    # The caps must be the ones BLOCKING ran with, not the KEY_SPECS defaults.
-    # This function used to read the defaults only, so `--acronym-cap 500` (and
-    # later `--band-cap`) changed the candidate file while `usable`, `cap cost`
-    # and both UNION lines went on describing a run that never happened.
-    # Measured: a 40x sweep of --band-cap moved macro recall from 81.48% to
-    # 77.29% while `the bucket cap costs` sat at 1.25% for every point -- a
-    # number that cannot move is not a measurement, which is the session-4
-    # budget-curve lesson in a third place.
+def resolve_caps(
+    max_bucket: int | None, acronym_cap: int | None, band_cap: int | None,
+) -> dict[str, int]:
+    """Every key's effective bucket cap, as BLOCKING would have applied it.
+
+    Split out of `key_diagnostics` so the miss report cannot drift from it.
+    Two functions computing "the cap" from the same flags by two copies of the
+    same three-branch rule is exactly how `usable` came to describe a run that
+    never happened, and the second copy would be the one nobody re-checks.
+    """
     def _cap(key: str, default: int) -> int:
         if max_bucket:
             return max_bucket
@@ -447,43 +480,38 @@ def key_diagnostics(
             return band_cap
         return default
 
-    caps = {k: _cap(k, c) for k, _, c in blocking.KEY_SPECS}
-    keys = list(caps)
+    return {k: _cap(k, c) for k, _, c in blocking.KEY_SPECS}
 
-    _section("per-key diagnostics")
-    print("  caps: " + ", ".join(f"{k}={v:,}" for k, v in caps.items()))
 
-    cols = ["entity_id", "country_norm", *keys]
-    s1 = pl.scan_parquet(paths.normalized_parquet(split, 1, work)).select(cols)
-    others = pl.concat(
-        [
-            pl.scan_parquet(paths.normalized_parquet(split, s, work)).select(cols)
-            for s in (2, 3)
-        ],
-        how="vertical",
-    )
+def annotate_agreement(
+    base: pl.DataFrame, others: pl.LazyFrame, keys: list[str],
+    caps: dict[str, int], min_lens: dict[str, int] | None = None,
+) -> pl.DataFrame:
+    """Add `_agree_<key>` and `_usable_<key>` for every key, to a pair frame.
 
-    truth = ground_truth_pairs(paths.ground_truth_tsv(data))
-    if sample_pairs:
-        truth = truth.head(sample_pairs)
+    `base` holds one row per pair with each key's value on the left under its
+    own name and on the right under `<key>_r`, plus `country_norm_r`. Both
+    `key_diagnostics` and `miss_report` need exactly this and they need it to
+    mean the same thing, so it lives in one place.
 
-    base = (
-        truth.join(s1, left_on="source1_entity_id", right_on="entity_id", how="inner")
-        .join(others, left_on="matched_entity_id", right_on="entity_id",
-              how="inner", suffix="_r")
-        .collect()
-    )
-    total = base.height
-    if total == 0:
-        print("  no true pairs resolved — check the normalized parquet.")
-        return
-    print(f"true pairs examined: {total:,}\n")
+    Each key is reduced to TWO booleans and its inputs dropped before the next
+    one is joined. That matters at twenty-one keys: holding every key's value
+    for both sides plus every bucket size over millions of pairs is several GB,
+    and it would be spent at the end of a run that has already paid for
+    blocking. The journal's "merge would have failed at the end of the longest
+    job" entry is the same shape -- peak memory in a step that runs last.
+
+    A key's own column and its `_r` twin are consumed here. A caller that needs
+    a key's VALUE afterwards (the miss report needs `name_sorted` to measure
+    how close a missed pair was) must copy it under another name first.
+    """
+    min_lens = min_lens or {}
 
     def _agrees(key: str) -> pl.Expr:
         """Both sides present and equal.
 
-        The emptiness test is not cosmetic and is the same one `_usable`
-        makes: two records that both normalize to an empty name would
+        The emptiness test is not cosmetic and is the same one the usability
+        test makes: two records that both normalize to an empty name would
         otherwise "agree" on every name key at once and be counted as reach
         this stage does not have. For a band key the analogue is nullness — an
         empty trigram list gives a null signature — and `str.len_chars()` on a
@@ -493,22 +521,28 @@ def key_diagnostics(
         eq = (pl.col(key) == pl.col(f"{key}_r")) & pl.col(key).is_not_null()
         if blocking.is_band(key):
             return eq & pl.col(f"{key}_r").is_not_null()
-        return eq & (pl.col(key).str.len_chars() > 0)
+        min_len = min_lens.get(key, 0)
+        ok = eq & (pl.col(key).str.len_chars() > 0)
+        if min_len > 1:
+            # `min_len` drops a value before blocking ever buckets it, on BOTH
+            # sides — `_s1_for_key` and `_target_table` each filter with
+            # `_usable(key, min_len)`. So a short acronym is not "agrees but
+            # capped", it is a key that never fired at all, and counting it as
+            # agreement would attribute a miss to the cap that the length rule
+            # caused.
+            ok = ok & (pl.col(f"{key}_r").str.len_chars() >= min_len)
+        return ok
 
-    # Target-side bucket sizes, so a key that agrees can be told apart from one
-    # that agrees AND would have survived the cap.
-    #
-    # Each key is reduced to TWO booleans and its inputs dropped before the
-    # next one is joined. That matters now in a way it did not at five keys:
-    # at twenty-one, holding every key's value for both sides plus every
-    # bucket size over 7.6M true pairs is several GB, and it would be spent at
-    # the end of a run that has already paid for blocking. The journal's
-    # "merge would have failed at the end of the longest job" entry is the same
-    # shape — peak memory in a step that runs last. Dropping as we go keeps
-    # this at 2 booleans per key regardless of how many keys there are.
     for key in keys:
+        min_len = min_lens.get(key, 0)
+        # Target-side bucket sizes, so a key that agrees can be told apart from
+        # one that agrees AND would have survived the cap. Filtered with
+        # `blocking._usable` first, because `_target_table` filters before it
+        # counts: without it a `min_len` run's buckets are measured over rows
+        # blocking had already discarded.
         sizes = (
-            others.select(blocking.blocking_key(key))
+            others.filter(blocking._usable(key, min_len))
+            .select(blocking.blocking_key(key))
             .group_by("bk").len().collect()
         )
         # Band signatures are UInt64 and `concat_str` will not take an integer
@@ -547,6 +581,60 @@ def key_diagnostics(
             .drop(f"_size_{key}", key, f"{key}_r")
         )
         del sizes
+    return base
+
+
+def key_diagnostics(
+    split: str, work: Path, data: Path, max_bucket: int | None,
+    sample_pairs: int | None, acronym_cap: int | None = None,
+    band_cap: int | None = None, acronym_min_len: int = 0,
+) -> None:
+    # The caps must be the ones BLOCKING ran with, not the KEY_SPECS defaults.
+    # This function used to read the defaults only, so `--acronym-cap 500` (and
+    # later `--band-cap`) changed the candidate file while `usable`, `cap cost`
+    # and both UNION lines went on describing a run that never happened.
+    # Measured: a 40x sweep of --band-cap moved macro recall from 81.48% to
+    # 77.29% while `the bucket cap costs` sat at 1.25% for every point -- a
+    # number that cannot move is not a measurement, which is the session-4
+    # budget-curve lesson in a third place.
+    caps = resolve_caps(max_bucket, acronym_cap, band_cap)
+    keys = list(caps)
+    min_lens = {"name_acronym": acronym_min_len} if acronym_min_len > 1 else {}
+
+    _section("per-key diagnostics")
+    print("  caps: " + ", ".join(f"{k}={v:,}" for k, v in caps.items()))
+    if min_lens:
+        print(f"  name_acronym min length: {acronym_min_len}")
+
+    cols = ["entity_id", "country_norm", *keys]
+    s1 = pl.scan_parquet(paths.normalized_parquet(split, 1, work)).select(cols)
+    others = pl.concat(
+        [
+            pl.scan_parquet(paths.normalized_parquet(split, s, work)).select(cols)
+            for s in (2, 3)
+        ],
+        how="vertical",
+    )
+
+    truth = ground_truth_pairs(paths.ground_truth_tsv(data))
+    if sample_pairs:
+        truth = truth.head(sample_pairs)
+
+    base = (
+        truth.join(s1, left_on="source1_entity_id", right_on="entity_id", how="inner")
+        .join(others, left_on="matched_entity_id", right_on="entity_id",
+              how="inner", suffix="_r")
+        .collect()
+    )
+    total = base.height
+    if total == 0:
+        print("  no true pairs resolved — check the normalized parquet.")
+        return
+    print(f"true pairs examined: {total:,}\n")
+
+    # Per-key agreement and usability, shared with the miss report so the two
+    # cannot disagree about what "usable" means.
+    base = annotate_agreement(base, others, keys, caps, min_lens)
 
     def _any(cols: list[str]) -> int:
         if not cols:
@@ -609,6 +697,554 @@ def key_diagnostics(
               "<- needs fuzzy matching; run without --bands 0")
 
 
+# --------------------------------------------------------------------------
+# which true pairs were missed, and why
+# --------------------------------------------------------------------------
+
+# Why a true pair can be absent from the candidate set. Ordered by how early
+# in the pipeline the pair was lost, and evaluated in that order, because the
+# reasons are not exclusive: a pair whose countries disagree also agrees on no
+# key, and reporting it as "no key agrees" would send the reader looking for a
+# better name key when no name key could ever have fired.
+#
+# The ordering is also the fix ordering. Everything above `budget` needs a
+# change to blocking's reach; `budget` alone is a number.
+# Trigram-Jaccard strata. ONE definition, used both by the similarity
+# breakdown under the reason table and by `--miss-order stratified`, so the
+# bands a reader is shown a cross-section of are the bands they were just
+# given counts for. Two copies would drift, and the drift would be invisible:
+# both would still print four plausible rows.
+SIMILARITY_BANDS: tuple[tuple[float, float], ...] = (
+    (0.8, 1.01), (0.5, 0.8), (0.2, 0.5), (0.0, 0.2),
+)
+
+MISS_REASONS: tuple[str, ...] = (
+    "country-mismatch",   # keys are country-partitioned, so nothing can fire
+    "no-key-agrees",      # every key disagrees: only a NEW key helps
+    "bucket-cap",         # a key agreed, its target bucket was over cap
+    "band-gate",          # band-only evidence, below --band-min-hits
+    "budget-evicted",     # generated and admitted, then cut by --budget
+    "unexplained",        # reachable, entity not at the cap: see the note below
+)
+
+
+def _raw_lookup(split: str, data: Path, sources: tuple[int, ...],
+                ids: list[str]) -> dict[str, tuple[str, str, str]]:
+    """{entity_id: (name, address, country)} for a handful of ids.
+
+    Read from the source TSVs rather than the normalized parquet, which keeps
+    only normalized keys — the point of an example is to see the string a
+    human would see. `quote_char=None` for the reason `main.scan_source` gives:
+    addresses contain stray quotes and letting polars interpret them merges
+    rows.
+    """
+    if not ids:
+        return {}
+    wanted = list(dict.fromkeys(ids))
+    frames = [
+        pl.scan_csv(
+            paths.source_tsv(split, s, data), separator="\t", quote_char=None,
+            has_header=True,
+            schema={c: pl.Utf8 for c in paths.SOURCE_COLUMNS},
+        ).filter(pl.col("entity_id").is_in(wanted))
+        for s in sources
+    ]
+    df = pl.concat(frames, how="vertical").collect()
+    return {
+        r["entity_id"]: (
+            r["business_name"] or "", r["business_address"] or "",
+            r["country"] or "",
+        )
+        for r in df.iter_rows(named=True)
+    }
+
+
+def _jaccard_pair(a: str, b: str) -> pl.Expr:
+    """Jaccard of two deduplicated list columns.
+
+    Union as `|a| + |b| - |a and b|` rather than a second set pass, the same
+    identity `features._jaccard_and_containment` uses and valid for the same
+    reason: `text_norm.trigram_expression` emits a UNIQUE list.
+    """
+    inter = pl.col(a).list.set_intersection(pl.col(b)).list.len()
+    union = pl.col(a).list.len() + pl.col(b).list.len() - inter
+    return pl.when(union == 0).then(0.0).otherwise(inter / union)
+
+
+def _containment_pair(a: str, b: str) -> pl.Expr:
+    """Overlap over the SMALLER of two deduplicated list columns.
+
+    Jaccard and containment disagree in exactly the case a missed pair is most
+    likely to be: `acme` against `acme foods private limited` has a low
+    Jaccard because one set is much larger, and a containment of 1.0. See
+    `features._jaccard_and_containment`, which makes the same distinction for
+    the model.
+    """
+    inter = pl.col(a).list.set_intersection(pl.col(b)).list.len()
+    smaller = pl.min_horizontal(pl.col(a).list.len(), pl.col(b).list.len())
+    return pl.when(smaller == 0).then(0.0).otherwise(inter / smaller)
+
+
+def miss_report(
+    split: str, work: Path, data: Path, cand_path: Path,
+    max_bucket: int | None, acronym_cap: int | None, band_cap: int | None,
+    acronym_min_len: int, band_min_hits: int, keys: tuple[str, ...] | None,
+    n_examples: int, order: str, seed: int, sample_pairs: int | None = None,
+    reason_filter: str = "no-key-agrees",
+) -> None:
+    """Classify every missed true pair, then print `n_examples` of them.
+
+    The per-key table says what each key reaches. It cannot say what happened
+    to the pairs that got away, because it is computed against the true pairs
+    rather than against the emitted file — a pair can be `usable` there and
+    still be absent from the candidate set, evicted by the per-entity budget.
+    This function starts from the MISSES themselves and attributes each one to
+    the stage that lost it, so "raise the budget", "loosen a cap" and "the keys
+    do not reach these at all" stop being three guesses about one number.
+
+    The caps, the length rule and the band gate must be the ones BLOCKING ran
+    with, for the reason recorded above `key_diagnostics`: recomputed from the
+    normalized parquet, this has no way to know what produced the candidate
+    file and will describe the defaults unless told.
+    """
+    selected = list(keys) if keys is not None else list(blocking.default_keys(None))
+    caps = resolve_caps(max_bucket, acronym_cap, band_cap)
+    caps = {k: v for k, v in caps.items() if k in selected}
+    min_lens = {"name_acronym": acronym_min_len} if acronym_min_len > 1 else {}
+
+    truth = ground_truth_pairs(paths.ground_truth_tsv(data)).rename(
+        {"matched_entity_id": "candidate_entity_id"}
+    )
+    cand = pl.scan_parquet(cand_path).select(
+        "source1_entity_id", "candidate_entity_id"
+    )
+    # An anti-join, not a left join with a flag. The misses are the small side
+    # here (a few percent of 7.6M against ~44M candidates) and they are all
+    # this function reads; materializing the found ones too would be the
+    # larger frame, held for nothing.
+    missed = truth.join(
+        cand, on=["source1_entity_id", "candidate_entity_id"], how="anti"
+    ).collect()
+
+    _section(f"missed true pairs [{split}] — {cand_path.name}")
+    n_true = int(truth.select(pl.len()).collect().item())
+    if missed.is_empty():
+        print(f"  no misses: all {n_true:,} true pairs are in the candidate set.")
+        return
+    n_missed_total = missed.height
+    print(f"true pairs                  : {n_true:,}")
+    print(f"MISSED                      : {n_missed_total:,} "
+          f"({n_missed_total / n_true:.2%})")
+    print(f"  keys assumed for attribution: {len(selected)} "
+          f"({'default set' if keys is None else 'from --keys/--bands'})")
+    # Every missed pair carries both sides' trigram lists through two joins,
+    # which is the memory shape of this section. At ~1.5M misses that is a few
+    # hundred MB and fine; `--sample-pairs` is the escape hatch if the miss set
+    # is larger than expected. SAMPLED, not `head`, unlike the per-key
+    # diagnostics: the misses arrive in candidate-file order, which is bucket
+    # order, which is a hash of the entity id — taking a prefix of that would
+    # be a prefix of a hash partition rather than of nothing in particular.
+    if sample_pairs and missed.height > sample_pairs:
+        missed = missed.sample(n=sample_pairs, seed=seed, shuffle=True)
+        print(f"  --sample-pairs: classifying a random {sample_pairs:,} of "
+              "them; the percentages below are over the sample.")
+
+    # The extra columns the sub-diagnosis reads. `name_trigrams` is not a
+    # blocking key, so `annotate_agreement` leaves it alone; `name_sorted` and
+    # `addr_sorted` are, and get consumed, so both are copied before the pass.
+    extra = ["name_trigrams"]
+    # Both are read as VALUES as well as being keys, and a `--keys` subset that
+    # leaves one out would otherwise make this section fail on a column
+    # blocking never needed. Requested explicitly and deduplicated, rather than
+    # assumed to be in `selected`.
+    cols = list(dict.fromkeys(
+        ["entity_id", "country_norm", *selected, "name_sorted", "addr_sorted",
+         *extra]
+    ))
+    s1 = pl.scan_parquet(paths.normalized_parquet(split, 1, work)).select(cols)
+    others = pl.concat(
+        [
+            pl.scan_parquet(paths.normalized_parquet(split, s, work)).select(cols)
+            for s in (2, 3)
+        ],
+        how="vertical",
+    )
+    base = (
+        missed.lazy()
+        .join(s1, left_on="source1_entity_id", right_on="entity_id", how="inner")
+        # Copied BEFORE the agreement pass, which consumes every key column.
+        # The NORMALIZED forms are what the examples have to show next to the
+        # raw strings: when no key agrees, the question is always whether the
+        # two records are genuinely different or whether normalization pulled
+        # them apart, and only the normalized pair answers it.
+        .with_columns(
+            pl.col("name_sorted").alias("_ns"),
+            pl.col("addr_sorted").alias("_as"),
+        )
+        .join(others, left_on="candidate_entity_id", right_on="entity_id",
+              how="inner", suffix="_r")
+        .with_columns(
+            pl.col("name_sorted_r").alias("_ns_r"),
+            pl.col("addr_sorted_r").alias("_as_r"),
+        )
+        .collect()
+    )
+    if base.is_empty():
+        print("  none of the missed pairs resolved against the normalized "
+              "parquet — check that it matches the candidate file's run.")
+        return
+    # Both joins are inner, so a missed pair whose either side is absent from
+    # the normalized parquet drops out here. Under `--sample` that is expected
+    # and large; on a full run it should be zero, and it has to be SAID either
+    # way — every percentage below is over `base`, not over the misses, and a
+    # silently smaller denominator is how a partial view gets read as a
+    # complete one.
+    if base.height != missed.height:
+        lost = missed.height - base.height
+        print(f"  NOTE: {lost:,} missed pair(s) ({lost / missed.height:.2%}) "
+              "have a side that is not in the normalized parquet and are "
+              "excluded from the attribution below. On a full run this should "
+              "be 0 — if it is not, the parquet and the candidate file are "
+              "from different runs.")
+
+    # Similarity of the two names, measured BEFORE the key columns are
+    # consumed. `tri_jac` is the number the LSH bands are a sampler of, so a
+    # miss with a high `tri_jac` is a band configuration failure rather than a
+    # hard pair — the distinction the aggregate below exists to make.
+    base = base.with_columns(
+        _jaccard_pair("name_trigrams", "name_trigrams_r").cast(pl.Float32)
+        .alias("tri_jac"),
+        _containment_pair("name_trigrams", "name_trigrams_r").cast(pl.Float32)
+        .alias("tri_cont"),
+        (
+            pl.col("country_norm").fill_null("")
+            == pl.col("country_norm_r").fill_null("")
+        ).alias("_country_ok"),
+    ).drop("name_trigrams", "name_trigrams_r")
+
+    base = annotate_agreement(base, others, selected, caps, min_lens)
+
+    # `annotate_agreement` compares key VALUES. The key blocking actually joins
+    # on is `<country>|value`, so a cross-country pair agrees on nothing no
+    # matter how identical the names are — and the first run of this printed
+    # "keys agreeing: name_sorted, name_nospace, addr_sorted, name_acronym, 16
+    # band(s)" under `reason=country-mismatch`, which reads as a contradiction
+    # and invites exactly the wrong fix. Folded in here rather than inside the
+    # helper, because `key_diagnostics` reports per-key reach and country is a
+    # separate partition there, not part of a key's definition.
+    base = base.with_columns([
+        (pl.col(f"_agree_{k}") & pl.col("_country_ok")).alias(f"_agree_{k}")
+        for k in selected
+    ] + [
+        (pl.col(f"_usable_{k}") & pl.col("_country_ok")).alias(f"_usable_{k}")
+        for k in selected
+    ])
+
+    exact = [k for k in selected if not blocking.is_band(k)]
+    bands = [k for k in selected if blocking.is_band(k)]
+    n_ub_exact = (
+        pl.sum_horizontal([pl.col(f"_usable_{k}").cast(pl.UInt8) for k in exact])
+        if exact else pl.lit(0)
+    )
+    n_ub_band = (
+        pl.sum_horizontal([pl.col(f"_usable_{k}").cast(pl.UInt8) for k in bands])
+        if bands else pl.lit(0)
+    )
+    any_agree = pl.any_horizontal([pl.col(f"_agree_{k}") for k in selected])
+
+    base = base.with_columns(
+        n_ub_exact.cast(pl.UInt8).alias("_n_exact"),
+        n_ub_band.cast(pl.UInt8).alias("_n_band"),
+        any_agree.alias("_any_agree"),
+    ).with_columns(
+        pl.when(~pl.col("_country_ok")).then(pl.lit("country-mismatch"))
+        .when(~pl.col("_any_agree")).then(pl.lit("no-key-agrees"))
+        .when(pl.col("_n_exact") + pl.col("_n_band") == 0)
+        .then(pl.lit("bucket-cap"))
+        .when(
+            (pl.col("_n_exact") == 0) & (pl.col("_n_band") < band_min_hits)
+        ).then(pl.lit("band-gate"))
+        .otherwise(pl.lit("budget-evicted"))
+        .alias("reason")
+    )
+
+    # `budget-evicted` is a claim about the merge, and it is checkable: an
+    # entity that did not fill its budget cannot have had a candidate evicted
+    # by it. Any pair that lands there for an unsaturated entity means this
+    # function's caps, key set or band gate are NOT the ones blocking ran with,
+    # which is the failure the whole file is written against — so it is
+    # relabelled and printed rather than absorbed into a plausible-looking
+    # number.
+    sizes = (
+        pl.scan_parquet(cand_path).group_by("source1_entity_id").len()
+        .rename({"len": "_n_cand"}).collect()
+    )
+    file_cap = int(sizes["_n_cand"].max() or 0)
+    base = base.join(sizes, on="source1_entity_id", how="left").with_columns(
+        pl.col("_n_cand").fill_null(0)
+    ).with_columns(
+        pl.when(
+            (pl.col("reason") == "budget-evicted")
+            & (pl.col("_n_cand") < file_cap)
+        ).then(pl.lit("unexplained")).otherwise(pl.col("reason")).alias("reason")
+    )
+
+    # Ordered by MISS_REASONS — pipeline order — rather than by count. A table
+    # whose rows move between runs cannot be diffed against the previous run,
+    # and comparing two runs is the only thing this table is for.
+    order_map = {r: i for i, r in enumerate(MISS_REASONS)}
+    counts = (
+        base.group_by("reason").len().rename({"len": "n"})
+        .with_columns(
+            pl.col("reason").replace_strict(
+                order_map, default=len(MISS_REASONS), return_dtype=pl.UInt8
+            ).alias("_ord")
+        )
+        .sort("_ord")
+    )
+    print(f"\n{'reason':<18} {'misses':>12} {'of misses':>11} {'of all true':>12}")
+    for row in counts.iter_rows(named=True):
+        # `of all true` is scaled from the classified sample back to every
+        # true pair, so the column means the same thing sampled or not.
+        share = row["n"] / base.height
+        print(f"{row['reason']:<18} {row['n']:>12,} "
+              f"{share:>10.2%} {share * n_missed_total / n_true:>11.2%}")
+    print(f"\n  budget cap observed on the file: {file_cap}")
+    print("  country-mismatch : every key is `<country>|value`, so these are")
+    print("                     unreachable until the partition is relaxed.")
+    print("  no-key-agrees    : needs a NEW key. The breakdown below says which.")
+    print("  bucket-cap       : a key DID agree — loosening that cap recovers it.")
+    print("  band-gate        : --band-min-hits rejected band-only evidence.")
+    print("  budget-evicted   : generated, ranked, and cut. --budget recovers it.")
+    unexplained = int(
+        counts.filter(pl.col("reason") == "unexplained")["n"].sum() or 0
+    )
+    if unexplained:
+        print(f"\n  WARNING: {unexplained:,} pair(s) are reachable under these "
+              "caps "
+              "for an entity that never filled its budget. Nothing in blocking "
+              "drops those, so the caps/keys/--band-min-hits passed here are "
+              "NOT the ones that built this file. Fix the flags before reading "
+              "any row above.")
+
+    # What the unreachable pairs actually look like. This is the half of the
+    # report that answers "is there a pattern a key could exploit", and it is
+    # deliberately split by trigram Jaccard: a miss at J >= 0.5 is one the LSH
+    # bands are supposed to catch and did not, which is a band-parameter
+    # finding. A miss at J < 0.2 shares almost no characters and no character
+    # method will ever reach it.
+    # `no-key-agrees` ONLY. A country-mismatch miss can sit at trigram J = 1.0
+    # — identical names either side of the partition — and including it made
+    # the first run print "the bands should reach these; they did not" about
+    # pairs no band could ever reach. It has its own row in the table above;
+    # mixing it in here answers a different question than the one asked.
+    hard = base.filter(pl.col("reason") == "no-key-agrees")
+    if not hard.is_empty():
+        print(f"\n  `no-key-agrees` misses, by name similarity "
+              f"({hard.height:,}) — same country, no key fires:")
+        empties = int(
+            hard.select(
+                (
+                    pl.col("_ns").fill_null("").str.len_chars().eq(0)
+                    | pl.col("_ns_r").fill_null("").str.len_chars().eq(0)
+                ).sum()
+            ).item()
+        )
+        # Containment rather than a substring test. `acme` against `acme foods
+        # private limited` is the case that matters — a truncated or
+        # abbreviated name — and containment is how `features.py` already
+        # measures it, over the same deduplicated trigram sets. A literal
+        # substring test would also need `str.contains` against a COLUMN
+        # pattern, which is a different and less portable thing to depend on.
+        cont = int(hard.select((pl.col("tri_cont") >= 0.9).sum()).item())
+        for lo, hi in SIMILARITY_BANDS:
+            n = int(
+                hard.select(
+                    ((pl.col("tri_jac") >= lo) & (pl.col("tri_jac") < hi)).sum()
+                ).item()
+            )
+            note = ""
+            if lo >= 0.5:
+                note = "  <- the bands should reach these; they did not"
+            elif lo == 0.0:
+                note = "  <- no character method reaches these"
+            print(f"    trigram J {lo:.1f}-{hi if hi <= 1 else 1.0:.1f} : "
+                  f"{n:>10,} ({n / hard.height:>6.2%}){note}")
+        print(f"    one name empty        : {empties:>10,} "
+              f"({empties / hard.height:.2%})  <- normalization, not blocking")
+        print(f"    one name inside other : {cont:>10,} "
+              f"({cont / hard.height:.2%})  <- trigram containment >= 0.9; a "
+              "prefix or containment key would reach these")
+
+    # ---- examples --------------------------------------------------------
+    if n_examples <= 0:
+        return
+
+    # Filtered to ONE reason, and by default to `no-key-agrees`.
+    #
+    # The other five reasons are already actionable from the table above: a
+    # `bucket-cap` miss says loosen that cap, a `budget-evicted` miss says
+    # raise the budget, a `country-mismatch` miss says relax the partition.
+    # None of them needs to be read. `no-key-agrees` is the only bucket where
+    # the table cannot tell you what to do, because the answer is "some key
+    # that does not exist yet" and the only way to find out which is to look
+    # at the pairs. So that is what this prints unless asked otherwise.
+    if reason_filter != "any":
+        ex_pool = base.filter(pl.col("reason") == reason_filter)
+        if ex_pool.is_empty():
+            print(f"\n  (no `{reason_filter}` misses to show; "
+                  "--miss-reason any prints from all of them)")
+            return
+    else:
+        ex_pool = base
+
+    # Ordered so that twenty rows SPAN the range rather than land in one
+    # corner of it.
+    #
+    # This matters more than it looks. Sorted by similarity the first twenty
+    # `no-key-agrees` misses are all near-duplicates and the reader concludes
+    # "one prefix key fixes everything"; sampled at random from a distribution
+    # that is mostly J < 0.2 they are all hopeless and the reader concludes
+    # "this needs a different method". Both conclusions are drawn from the
+    # sort order rather than from the data. `stratified` takes an equal share
+    # from each similarity band, so the printout is a cross-section and the
+    # TABLE above stays the thing that says how common each band is.
+    if order == "stratified":
+        per_band = max(1, n_examples // len(SIMILARITY_BANDS))
+        parts = []
+        for lo, hi in SIMILARITY_BANDS:
+            part = ex_pool.filter(
+                (pl.col("tri_jac") >= lo) & (pl.col("tri_jac") < hi)
+            ).sort("tri_jac", descending=True)
+            parts.append(part.head(per_band))
+        picked = pl.concat(parts, how="vertical")
+        # Bands can be empty or short, so the quota is a floor and the
+        # remainder is topped up MOST-SIMILAR FIRST rather than at random.
+        # That bias is deliberate: once every band is represented, the rows
+        # worth spending the rest of the page on are the near-misses, because
+        # those are the ones a new key could plausibly reach.
+        if picked.height < n_examples:
+            rest = ex_pool.join(
+                picked.select("source1_entity_id", "candidate_entity_id"),
+                on=["source1_entity_id", "candidate_entity_id"], how="anti",
+            ).sort("tri_jac", descending=True)
+            picked = pl.concat([picked, rest.head(n_examples - picked.height)],
+                               how="vertical")
+        picked = picked.sort("tri_jac", descending=True).head(n_examples)
+    elif order == "most-similar":
+        picked = ex_pool.sort("tri_jac", descending=True).head(n_examples)
+    elif order == "most-missed":
+        counts_e = (
+            ex_pool.group_by("source1_entity_id").len()
+            .rename({"len": "_n_miss_e"})
+        )
+        picked = (
+            ex_pool.join(counts_e, on="source1_entity_id", how="left")
+            .sort(["_n_miss_e", "source1_entity_id"], descending=[True, False])
+            .head(n_examples)
+        )
+    elif order == "worst":
+        # Entities that scored a FLAT ZERO: every true match missed. Not the
+        # same set as "missed the most" — an entity missing 4 of 5 is a worse
+        # miss count and a better score than one missing its only match.
+        n_true_e = (
+            ground_truth_pairs(paths.ground_truth_tsv(data))
+            .group_by("source1_entity_id").len().rename({"len": "n_true"})
+            .collect()
+        )
+        n_miss_e = (
+            base.group_by("source1_entity_id").len()
+            .rename({"len": "_n_miss_e"})
+        )
+        picked = (
+            ex_pool.join(n_true_e, on="source1_entity_id", how="left")
+            .join(n_miss_e, on="source1_entity_id", how="left")
+            .with_columns(
+                (pl.col("n_true") - pl.col("_n_miss_e")).alias("_found")
+            )
+            .sort(["_found", "n_true"], descending=[False, True])
+            .head(n_examples)
+        )
+    else:
+        picked = ex_pool.sample(
+            n=min(ex_pool.height, n_examples), seed=seed, shuffle=True
+        ).sort("tri_jac", descending=True)
+
+    # Grouped by entity for DISPLAY only. The selection above is per pair, so
+    # `--show-misses 20` prints exactly twenty pairs — the earlier version
+    # added a whole entity at a time and overshot.
+    ent_order: list[str] = []
+    for eid in picked["source1_entity_id"].to_list():
+        if eid not in ent_order:
+            ent_order.append(eid)
+
+    got = (
+        pl.scan_parquet(cand_path)
+        .filter(pl.col("source1_entity_id").is_in(ent_order))
+        .select("source1_entity_id", "candidate_entity_id", "block_score",
+                "n_keys")
+        .collect()
+        .sort("block_score", descending=True)
+    )
+    raw_l = _raw_lookup(split, data, (1,), ent_order)
+    raw_r = _raw_lookup(
+        split, data, (2, 3),
+        picked["candidate_entity_id"].to_list()
+        + got["candidate_entity_id"].to_list(),
+    )
+
+    agree_cols = [f"_agree_{k}" for k in selected]
+    label_reason = "" if reason_filter == "any" else f"`{reason_filter}` "
+    _section(f"{picked.height} {label_reason}misses across "
+             f"{len(ent_order)} entities (--miss-order {order})")
+    if reason_filter == "no-key-agrees":
+        print("Normalized forms are shown under the raw ones: when no key "
+              "agrees,\nthe question is whether the records really differ or "
+              "whether\nnormalization pulled them apart, and only the "
+              "normalized pair says.\n")
+    for eid in ent_order:
+        rows = picked.filter(pl.col("source1_entity_id") == eid)
+        name, addr, country = raw_l.get(eid, ("<not in source1>", "", ""))
+        n_cand = int(rows["_n_cand"][0])
+        print(f"\n{'-' * 70}")
+        print(f"source1 {eid}  [{country}]")
+        print(f"  name : {name}")
+        print(f"  norm : {rows['_ns'][0]}")
+        print(f"  addr : {addr}")
+        print(f"  anorm: {rows['_as'][0]}")
+        print(f"  blocking returned {n_cand} candidates"
+              f"{' (AT the cap)' if n_cand >= file_cap else ''}")
+        for r in rows.iter_rows(named=True):
+            cid = r["candidate_entity_id"]
+            cname, caddr, ccountry = raw_r.get(cid, ("<not in source2/3>", "", ""))
+            agreed = [k for k, c in zip(selected, agree_cols) if r[c]]
+            band_agreed = sum(1 for k in agreed if blocking.is_band(k))
+            shown_keys = [k for k in agreed if not blocking.is_band(k)]
+            if band_agreed:
+                shown_keys.append(f"{band_agreed} band(s)")
+            print(f"  MISSED {cid}  [{ccountry}]  reason={r['reason']}  "
+                  f"trigram J={r['tri_jac']:.2f} cont={r['tri_cont']:.2f}")
+            print(f"    name : {cname}")
+            print(f"    norm : {r['_ns_r']}")
+            print(f"    addr : {caddr}")
+            print(f"    anorm: {r['_as_r']}")
+            print(f"    keys agreeing: "
+                  f"{', '.join(shown_keys) if shown_keys else 'NONE'}")
+        # What blocking returned instead. For a `no-key-agrees` miss this is
+        # not what displaced the true match — nothing displaced it, it was
+        # never generated — but it is still the fastest way to see what the
+        # keys DID fire on for this entity, which is half of why they missed.
+        top = got.filter(pl.col("source1_entity_id") == eid).head(3)
+        if not top.is_empty():
+            label = ("also returned" if reason_filter == "no-key-agrees"
+                     else "kept instead")
+            print(f"    {label} (top 3 by block_score):")
+            for g in top.iter_rows(named=True):
+                gname = raw_r.get(g["candidate_entity_id"], ("?", "", ""))[0]
+                print(f"      {g['block_score']:.3f}  n_keys={g['n_keys']}  "
+                      f"{gname}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Evaluate blocking recall.")
     p.add_argument("--split", default="train", choices=paths.SPLITS)
@@ -627,6 +1263,62 @@ def main() -> None:
         "--band-cap", type=int, default=None,
         help="The --band-cap BLOCKING was run with. See --acronym-cap.",
     )
+    p.add_argument(
+        "--acronym-min-len", type=int, default=0,
+        help="The --acronym-min-len BLOCKING was run with. See --acronym-cap. "
+        "It drops a value on BOTH sides before bucketing, so a miss under it "
+        "is not 'agrees but capped' — it is a key that never fired.",
+    )
+    p.add_argument(
+        "--band-min-hits", type=int, default=1,
+        help="The --band-min-hits BLOCKING was run with. Only the miss report "
+        "reads it: it is what separates a pair the bands found and the gate "
+        "rejected from one the budget evicted.",
+    )
+    p.add_argument(
+        "--keys", default=None,
+        help="The --keys BLOCKING was run with, comma-separated. The miss "
+        "report defaults to blocking's own default set (which excludes "
+        "name_core); the per-key table above still reports every key in "
+        "KEY_SPECS.",
+    )
+    p.add_argument(
+        "--bands", type=int, default=None,
+        help="The --bands BLOCKING was run with. Mutually exclusive with "
+        "--keys, as in blocking.",
+    )
+    p.add_argument(
+        "--show-misses", type=int, default=20, metavar="N",
+        help="Print N missed true pairs in full, with the raw name and "
+        "address of both sides, why each was missed, and what blocking kept "
+        "instead (default: %(default)s). 0 skips the whole section.",
+    )
+    p.add_argument(
+        "--miss-reason", default="no-key-agrees",
+        choices=(*MISS_REASONS, "any"),
+        help="Which kind of miss to print examples of (default: "
+        "%(default)s). The other reasons are already actionable from the "
+        "summary table — a bucket-cap miss says loosen that cap, a "
+        "budget-evicted one says raise the budget. `no-key-agrees` is the "
+        "bucket the table cannot act on, because the answer is a key that "
+        "does not exist yet and the only way to find out which is to read "
+        "the pairs.",
+    )
+    p.add_argument(
+        "--miss-order", default="stratified",
+        choices=("stratified", "most-similar", "worst", "most-missed",
+                 "random"),
+        help="Which of them to print (default: %(default)s). `stratified` "
+        "takes an equal share from each trigram-similarity band, so twenty "
+        "rows span the range instead of landing in one corner of it — "
+        "sorted by similarity they would all be near-duplicates, sampled at "
+        "random they would all be hopeless, and either way the conclusion "
+        "comes from the sort order rather than the data. `most-similar` is "
+        "the near-misses alone, `worst` the entities that found none of "
+        "their true matches, `most-missed` the largest miss counts.",
+    )
+    p.add_argument("--seed", type=int, default=0,
+                   help="Sampling seed for --miss-order random.")
     p.add_argument("--max-bucket", type=int, default=None,
                    help="Global cap override for the diagnostics. Leave unset "
                         "to use each key's own cap from KEY_SPECS.")
@@ -635,6 +1327,8 @@ def main() -> None:
                         "memory only — it biases nothing, but it does make the "
                         "percentages noisier.")
     p.add_argument("--no-key-diagnostics", action="store_true")
+    p.add_argument("--no-miss-report", action="store_true",
+                   help="Skip the missed-pair classification and examples.")
     p.add_argument("--budget-curve", default="1,2,3,5,8,12,16,20,30",
                    help="Per-entity cuts to report macro recall at, read off "
                         "the SAME candidate file. Cuts above the budget "
@@ -648,6 +1342,25 @@ def main() -> None:
                         "output for this split.")
     progress.add_arguments(p)
     a = p.parse_args()
+
+    if a.keys is not None and a.bands is not None:
+        p.error("pass --keys or --bands, not both, exactly as blocking "
+                "requires: --keys already names the band subset.")
+    if a.keys is not None:
+        keys = tuple(k.strip() for k in a.keys.split(",") if k.strip())
+        unknown = sorted(set(keys) - set(blocking.KEY_COLUMNS))
+        if unknown:
+            p.error(f"unknown key(s) {unknown}; available: "
+                    f"{list(blocking.KEY_COLUMNS)}")
+    elif a.bands is not None:
+        # Validated by `default_keys`, which raises on an out-of-range band
+        # count — the same check and the same message blocking gives.
+        try:
+            keys = blocking.default_keys(a.bands)
+        except ValueError as exc:
+            p.error(str(exc))
+    else:
+        keys = None
 
     work = paths.work_root(a.work_root)
     data = paths.data_root(a.data_root)
@@ -679,6 +1392,14 @@ def main() -> None:
         if cuts:
             with progress.stage("eval/budget-curve", cuts=len(cuts)):
                 budget_curve(a.split, work, data, cand_path, cuts)
+        if not a.no_miss_report:
+            with progress.stage("eval/miss-report", show=a.show_misses):
+                miss_report(
+                    a.split, work, data, cand_path, a.max_bucket,
+                    a.acronym_cap, a.band_cap, a.acronym_min_len,
+                    a.band_min_hits, keys, a.show_misses, a.miss_order,
+                    a.seed, a.sample_pairs, a.miss_reason,
+                )
 
     if not a.no_key_diagnostics:
         # The per-key diagnostics rebuild every key's target table, so this
@@ -687,7 +1408,7 @@ def main() -> None:
         # the candidate file.
         with progress.stage("eval/key-diagnostics"):
             key_diagnostics(a.split, work, data, a.max_bucket, a.sample_pairs,
-                        a.acronym_cap, a.band_cap)
+                            a.acronym_cap, a.band_cap, a.acronym_min_len)
     progress.shutdown()
 
 
