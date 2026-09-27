@@ -1003,6 +1003,50 @@ def generate_model(
     return cands, matches, scored_entities
 
 
+def write_candidate_submission(
+    cand_path: Path, split: str, data: Path, out_path: Path,
+    sample: int | None = None,
+) -> None:
+    """`candidate_pairs.tsv` straight from the candidate parquet.
+
+    This exists because `candidate_pairs.tsv` was written in exactly ONE
+    place — the `src.main` CLI — and the staged path everything is actually
+    run through (`src.blocking` -> `src.features` -> `src.model`) ends at
+    `src.model`, which writes only `matching_results.tsv`. A full staged run
+    therefore produced half a submission, silently, with every stage
+    reporting success.
+
+    Grouped LAZILY, unlike `write_submission`, which takes an in-memory frame.
+    The candidate set is ~130M rows at budget 60 and larger above it;
+    collecting it just to group it is several GB spent at the very end of a
+    multi-hour run, which is the one place a failure costs the most.
+    """
+    all_s1 = scan_source(split, 1, data, sample).select("entity_id")
+    grouped = (
+        pl.scan_parquet(cand_path)
+        .group_by("source1_entity_id")
+        .agg(pl.col("candidate_entity_id").unique().sort().alias("ids"))
+        .rename({"source1_entity_id": "entity_id"})
+    )
+    full = (
+        all_s1.join(grouped, on="entity_id", how="left")
+        .with_columns(pl.col("ids").fill_null([]))
+        .select(
+            pl.col("entity_id").alias("source1_entity_id"),
+            pl.col("ids").list.join(",").alias("candidate_entity_ids"),
+        )
+        .collect()
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with progress.stage(f"write/{out_path.name}") as st:
+        full.write_csv(out_path, separator="\t", include_header=True,
+                       quote_style="never")
+        st.set(rows=full.height,
+               tsv_mb=round(out_path.stat().st_size / 1_048_576, 1)
+               if out_path.is_file() else None)
+    print(f"  wrote {full.height:,} rows -> {out_path}")
+
+
 def write_submission(
     pairs: pl.DataFrame, split: str, data: Path, sample: int | None,
     out_path: Path, column: str,

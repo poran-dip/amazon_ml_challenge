@@ -199,6 +199,16 @@ KEY_SPECS: tuple[tuple[str, float, int], ...] = (
     # (`assetbuildingfund`) is ONE token and shares none with `asset building
     # fund care`, while the two agree on their first twelve characters.
     ("name_prefix", 0.75, 2000),
+    # Appended last, after the token keys, for the same reason they were
+    # appended after the bands: every existing key_mask bit keeps its value.
+    #
+    # Weaker evidence than every other name key, because a character anagram
+    # discards the token boundaries AND the character order: `enterprises
+    # acme`, `acme enterprises` and any other arrangement of those letters
+    # share one key. 0.60 puts it last among the name keys in the budget
+    # ranking, which is the intended order — an exact name match should never
+    # be displaced by an anagram of it.
+    ("name_charsort", 0.60, 2000),
 )
 
 KEY_COLUMNS: tuple[str, ...] = tuple(k for k, _, _ in KEY_SPECS)
@@ -1692,4 +1702,3 @@ def tfidf_retrieval_blocking(
 
 if __name__ == "__main__":
     main()
-

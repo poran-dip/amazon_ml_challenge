@@ -901,6 +901,19 @@ def main() -> None:
         pairs.rename({ENT: "entity_id"}), a.split, data, None,
         out / "matching_results.tsv", "matched_entity_ids",
     )
+    # BOTH deliverables, from the stage that finishes the run.
+    #
+    # `candidate_pairs.tsv` used to be written only by the `src.main` CLI, so
+    # the staged path — blocking, features, then this module — produced a
+    # submission with one of its two files missing and said nothing about it.
+    cand_path = paths.candidates_parquet(a.split, work)
+    if cand_path.is_file():
+        pipeline.write_candidate_submission(
+            cand_path, a.split, data, out / "candidate_pairs.tsv",
+        )
+    else:
+        print(f"  WARNING: {cand_path} is missing, so candidate_pairs.tsv was "
+              "NOT written. The submission is incomplete.")
     if a.split == "train":
         score = pipeline.macro_f05(preds, data, "matched_entity_ids",
                                    restrict_to=scored_entities)
