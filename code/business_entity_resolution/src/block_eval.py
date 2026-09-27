@@ -488,7 +488,7 @@ def resolve_caps(
 
 def _annotate_token_keys(
     base: pl.DataFrame, others: pl.LazyFrame, keys: list[str],
-    caps: dict[str, int],
+    caps: dict[str, int], keep_sizes: bool = False,
 ) -> pl.DataFrame:
     """`_agree_<key>` / `_usable_<key>` for the multi-valued keys.
 
@@ -551,8 +551,18 @@ def _annotate_token_keys(
                     & pl.col("_min_size").fill_null(10**9).le(caps[key])
                 ).alias(f"_usable_{key}")
             )
-            .drop("_min_size", "_shared", key, f"{key}_r")
+            .drop("_shared", key, f"{key}_r")
         )
+        if keep_sizes:
+            # The SMALLEST bucket any shared token sits in is the whole
+            # answer to "would this pair survive a cap of C", for every C at
+            # once. Kept as one UInt32 per token key — 91MB over 7.6M pairs —
+            # which is what makes the sweep one pass instead of one pass per
+            # cap. The boolean above is just this column thresholded at the
+            # cap the caller asked about.
+            base = base.rename({"_min_size": f"_minsize_{key}"})
+        else:
+            base = base.drop("_min_size")
         del sizes, priced
     return base.drop("_row")
 
@@ -560,6 +570,7 @@ def _annotate_token_keys(
 def annotate_agreement(
     base: pl.DataFrame, others: pl.LazyFrame, keys: list[str],
     caps: dict[str, int], min_lens: dict[str, int] | None = None,
+    keep_token_sizes: bool = False,
 ) -> pl.DataFrame:
     """Add `_agree_<key>` and `_usable_<key>` for every key, to a pair frame.
 
@@ -609,7 +620,8 @@ def annotate_agreement(
 
     token_keys = [k for k in keys if blocking.is_token(k)]
     if token_keys:
-        base = _annotate_token_keys(base, others, token_keys, caps)
+        base = _annotate_token_keys(base, others, token_keys, caps,
+                                    keep_sizes=keep_token_sizes)
         keys = [k for k in keys if not blocking.is_token(k)]
 
     for key in keys:
@@ -663,11 +675,129 @@ def annotate_agreement(
     return base
 
 
+def _token_cap_sweep(
+    base: pl.DataFrame, keys: list[str], tokens: list[str], total: int,
+    cuts: tuple[int, ...], split: str, work: Path,
+) -> None:
+    """Reachable share and emitted-pair cost at several token caps, one pass.
+
+    This is the sweep that has to happen BEFORE a budget sweep, because the
+    two are not independent and only one of them has a ceiling. `UNION (what
+    stage A can reach)` is exactly that ceiling: no per-entity budget, however
+    large, can put a pair in the candidate set that no key ever generated. So
+    a budget curve run under a cap that reaches 88.74% is a curve that
+    asymptotes to 88.74%, and every point on it is measuring the wrong knob.
+
+    Both columns come off work already done. `_minsize_<key>` is the smallest
+    bucket any shared token sits in, so `usable at cap C` is that column
+    thresholded at C — every cut, from one pass. The cost column is
+    `blocking.projected_pairs` at the same cut, which is EXACT and is what
+    `--max-pairs-per-key` will be checked against, so the recall and the
+    price come from the same place rather than from a run and an estimate.
+    """
+    non_token = [k for k in keys if k not in tokens]
+    other_usable = (
+        pl.any_horizontal([pl.col(f"_usable_{k}") for k in non_token])
+        if non_token else pl.lit(False)
+    )
+
+    # Per-key censuses for the cost column, built once. Source 1 is counted
+    # per bucket too: fan-out is (source-1 rows in the bucket) x (target rows
+    # in it), which is what `projected_pairs` sums.
+    s1_lf = pl.scan_parquet(paths.normalized_parquet(split, 1, work))
+    others_lf = pl.concat(
+        [pl.scan_parquet(paths.normalized_parquet(split, s, work))
+         for s in (2, 3)],
+        how="vertical",
+    )
+    # (bucket, source-1 rows in it, target rows in it) per key, once. Every
+    # cap is then a filter and a sum over this.
+    #
+    # The product is written out here rather than delegated to
+    # `blocking.projected_pairs`, which counts its own rows and therefore
+    # needs the raw per-row frame. Handing it these counts made every `n_s1`
+    # read as 1, so the cost column reported `sum(bucket_size)` instead of
+    # `sum(n_s1 * bucket_size)` — 41.7M for a configuration that projects
+    # 15.0 BILLION, and a blocking run was started on the strength of it.
+    # `projected_pairs` now refuses a pre-aggregated frame outright.
+    sized: dict[str, pl.DataFrame] = {}
+    for key in tokens:
+        tgt = (
+            blocking._maybe_explode(
+                others_lf.select("country_norm", key), key)
+            .filter(blocking._usable(key))
+            .select(blocking.blocking_key(key))
+            .group_by("bk").len().rename({"len": "bucket_size"})
+        )
+        src = (
+            blocking._maybe_explode(s1_lf.select("country_norm", key), key)
+            .filter(blocking._usable(key))
+            .select(blocking.blocking_key(key))
+            .group_by("bk").len().rename({"len": "n_s1"})
+        )
+        sized[key] = (
+            src.join(tgt, on="bk", how="inner")
+            .select(
+                pl.col("bucket_size").cast(pl.Int64),
+                (pl.col("n_s1").cast(pl.Int64)
+                 * pl.col("bucket_size").cast(pl.Int64)).alias("pairs"),
+            )
+            .collect()
+        )
+
+    per_key_limit = blocking.MAX_PAIRS_PER_KEY_DEFAULT
+    _section("token cap sweep — the CEILING a budget sweep runs into")
+    head = f"{'token cap':>10} {'UNION at cap':>13} {'unreachable':>12}"
+    for key in tokens:
+        head += f" {key:>16}"
+    head += f" {'TOTAL':>17}"
+    print(head)
+    for cap in cuts:
+        reach = pl.any_horizontal(
+            [other_usable]
+            + [
+                pl.col(f"_agree_{k}") & pl.col(f"_minsize_{k}")
+                .fill_null(10**9).le(cap)
+                for k in tokens
+            ]
+        )
+        union = int(base.select(reach.sum()).item())
+        row = (f"{cap:>10,} {union / total:>12.2%} "
+               f"{1 - union / total:>11.2%}")
+        grand = 0
+        over = False
+        for key in tokens:
+            cost = int(
+                sized[key].filter(pl.col("bucket_size") <= cap)
+                .select(pl.col("pairs").sum()).item() or 0
+            )
+            grand += cost
+            flag = "!" if cost > per_key_limit else " "
+            row += f" {cost:>15,}{flag}"
+            over = over or cost > per_key_limit
+        row += f" {grand:>17,}"
+        if over:
+            row += "  <- REFUSED"
+        print(row)
+    print("\n  UNION at cap is the hard ceiling on PAIR RECALL for a blocking")
+    print("  run at that cap. A larger --budget cannot pass it: the budget")
+    print("  chooses among candidates that were generated, and these were not.")
+    print("  The per-key columns are EXACT raw emitted pairs — the same number")
+    print("  `_emit_key` computes and refuses on. A `!` means that key alone")
+    print(f"  exceeds --max-pairs-per-key ({per_key_limit:,}), so blocking will")
+    print("  abort on it; the run's other keys are emitted first and wasted.")
+    print("  Fan-out here is sum(source-1 rows in bucket x target rows in it),")
+    print("  so it grows with the SQUARE of bucket size, not linearly — which")
+    print("  is why these numbers explode far faster than the recall column")
+    print("  improves. Pick the largest cap that is not refused, then sweep")
+    print("  the budget under it.")
+
+
 def key_diagnostics(
     split: str, work: Path, data: Path, max_bucket: int | None,
     sample_pairs: int | None, acronym_cap: int | None = None,
     band_cap: int | None = None, acronym_min_len: int = 0,
-    token_cap: int | None = None,
+    token_cap: int | None = None, cap_sweep: tuple[int, ...] = (),
 ) -> None:
     # The caps must be the ones BLOCKING ran with, not the KEY_SPECS defaults.
     # This function used to read the defaults only, so `--acronym-cap 500` (and
@@ -714,7 +844,8 @@ def key_diagnostics(
 
     # Per-key agreement and usability, shared with the miss report so the two
     # cannot disagree about what "usable" means.
-    base = annotate_agreement(base, others, keys, caps, min_lens)
+    base = annotate_agreement(base, others, keys, caps, min_lens,
+                              keep_token_sizes=bool(cap_sweep))
 
     def _any(cols: list[str]) -> int:
         if not cols:
@@ -723,6 +854,7 @@ def key_diagnostics(
 
     exact = [k for k in keys if not blocking.is_band(k)]
     bands = [k for k in keys if blocking.is_band(k)]
+    tokens = [k for k in keys if blocking.is_token(k)]
 
     print(f"{'key':<14} {'agrees':>9} {'usable':>9} {'cap cost':>9} {'unique':>9}")
     for key in keys:
@@ -776,6 +908,9 @@ def key_diagnostics(
         print(f"UNREACHABLE by any exact key   : {1 - uncapped / total:.2%} "
               "<- needs fuzzy matching; run without --bands 0")
 
+    if cap_sweep and tokens:
+        _token_cap_sweep(base, keys, tokens, total, cap_sweep, split, work)
+
 
 # --------------------------------------------------------------------------
 # which true pairs were missed, and why
@@ -794,6 +929,10 @@ def key_diagnostics(
 # bands a reader is shown a cross-section of are the bands they were just
 # given counts for. Two copies would drift, and the drift would be invisible:
 # both would still print four plausible rows.
+# How many missed pairs the classifier looks at when `--sample-pairs` is not
+# given. See the note where it is applied.
+MISS_CLASSIFY_DEFAULT = 2_000_000
+
 SIMILARITY_BANDS: tuple[tuple[float, float], ...] = (
     (0.8, 1.01), (0.5, 0.8), (0.2, 0.5), (0.0, 0.2),
 )
@@ -924,10 +1063,22 @@ def miss_report(
     # diagnostics: the misses arrive in candidate-file order, which is bucket
     # order, which is a hash of the entity id — taking a prefix of that would
     # be a prefix of a hash partition rather than of nothing in particular.
-    if sample_pairs and missed.height > sample_pairs:
-        missed = missed.sample(n=sample_pairs, seed=seed, shuffle=True)
-        print(f"  --sample-pairs: classifying a random {sample_pairs:,} of "
-              "them; the percentages below are over the sample.")
+    # An UNSET `--sample-pairs` is capped rather than taken as "all of them".
+    #
+    # Every classified pair carries both sides' token lists and trigram lists
+    # through two joins, so the cost of this section is linear in the miss
+    # count and the miss count is not bounded by anything the caller chose. A
+    # default of "however many there are" means the section's memory is set by
+    # how badly blocking did, which is the one number nobody can predict
+    # before running it. Two million is enough that every percentage below is
+    # exact to three decimal places and small enough to stay in memory.
+    limit = sample_pairs if sample_pairs else MISS_CLASSIFY_DEFAULT
+    if limit and missed.height > limit:
+        missed = missed.sample(n=limit, seed=seed, shuffle=True)
+        how = "--sample-pairs" if sample_pairs else "default cap"
+        print(f"  {how}: classifying a random {limit:,} of them; the "
+              "percentages below are over that sample. Pass --sample-pairs 0 "
+              "to classify every miss.")
 
     # The extra columns the sub-diagnosis reads. `name_trigrams` is not a
     # blocking key, so `annotate_agreement` leaves it alone; `name_sorted` and
@@ -941,13 +1092,46 @@ def miss_report(
         ["entity_id", "country_norm", *selected, "name_sorted", "addr_sorted",
          *extra]
     ))
-    s1 = pl.scan_parquet(paths.normalized_parquet(split, 1, work)).select(cols)
-    others = pl.concat(
+    s1_all = pl.scan_parquet(paths.normalized_parquet(split, 1, work))
+    others_all = pl.concat(
         [
-            pl.scan_parquet(paths.normalized_parquet(split, s, work)).select(cols)
+            pl.scan_parquet(paths.normalized_parquet(split, s, work))
             for s in (2, 3)
         ],
         how="vertical",
+    )
+    # The bucket censuses are computed over the WHOLE target corpus — a
+    # token's document frequency is a property of the corpus, not of the pairs
+    # being looked at — but they only ever read `country_norm` and one key, so
+    # they get their own narrow frame.
+    others_census = others_all.select(["country_norm", *selected])
+
+    # The joins below get a SEMI-FILTERED corpus, and this is the difference
+    # between a section that runs and one that does not.
+    #
+    # Joining the misses against the full target side made polars build a hash
+    # table over 10.3M rows of 27 columns — three token-key LISTS and a ~30
+    # element trigram list per row, on both sides. That is several GB before
+    # the join output exists, it is spent to look at a million pairs, and on a
+    # 16GB machine with 8.5GB free it goes to swap and never comes back: the
+    # observed symptom was the editor freezing with no output at all.
+    #
+    # The misses name at most a few million distinct ids out of 12.5M, so
+    # restricting both sides to the ids that actually appear costs one pass
+    # over a two-column projection and removes most of the corpus from the
+    # join. The censuses above are deliberately NOT filtered this way, because
+    # narrowing them would change what a bucket size means.
+    hit_s1 = missed.select("source1_entity_id").unique().lazy()
+    hit_tgt = missed.select("candidate_entity_id").unique().lazy()
+    s1 = (
+        s1_all.join(hit_s1, left_on="entity_id",
+                    right_on="source1_entity_id", how="semi")
+        .select(cols)
+    )
+    others = (
+        others_all.join(hit_tgt, left_on="entity_id",
+                        right_on="candidate_entity_id", how="semi")
+        .select(cols)
     )
     base = (
         missed.lazy()
@@ -1002,7 +1186,7 @@ def miss_report(
         ).alias("_country_ok"),
     ).drop("name_trigrams", "name_trigrams_r")
 
-    base = annotate_agreement(base, others, selected, caps, min_lens)
+    base = annotate_agreement(base, others_census, selected, caps, min_lens)
 
     # `annotate_agreement` compares key VALUES. The key blocking actually joins
     # on is `<country>|value`, so a cross-country pair agrees on nothing no
@@ -1407,9 +1591,21 @@ def main() -> None:
                    help="Global cap override for the diagnostics. Leave unset "
                         "to use each key's own cap from KEY_SPECS.")
     p.add_argument("--sample-pairs", type=int, default=None,
-                   help="Cap the true pairs used for per-key diagnostics. For "
-                        "memory only — it biases nothing, but it does make the "
-                        "percentages noisier.")
+                   help="Cap the true pairs used for per-key diagnostics and "
+                        "the missed-pair classification. For memory only — it "
+                        "biases nothing, but it does make the percentages "
+                        f"noisier. The miss classifier caps itself at "
+                        f"{MISS_CLASSIFY_DEFAULT:,} when this is unset, "
+                        "because its cost is linear in a miss count nobody "
+                        "can predict; pass 0 to classify every miss.")
+    p.add_argument(
+        "--cap-sweep", default="",
+        help="Comma-separated token caps to report reachability and cost at, "
+        "e.g. `40,100,250,500,1000,2000`. Read off ONE pass over the true "
+        "pairs and needs no blocking run. Do this before any budget sweep: "
+        "`UNION at cap` is the ceiling a budget curve asymptotes to, so a "
+        "curve run under the wrong cap measures the wrong knob.",
+    )
     p.add_argument("--no-key-diagnostics", action="store_true")
     p.add_argument("--no-miss-report", action="store_true",
                    help="Skip the missed-pair classification and examples.")
@@ -1419,8 +1615,14 @@ def main() -> None:
                         "blocking ran with are silently unreachable. Pass an "
                         "empty string to skip.")
     p.add_argument("--no-candidate-recall", action="store_true",
-                   help="Skip the emitted-candidate section, so the per-key "
-                        "numbers can be read without running blocking first.")
+                   help="Skip the candidate-recall section ONLY. It joins the "
+                        "whole candidate file against the true pairs, which "
+                        "at a large budget is a hash table over hundreds of "
+                        "millions of rows for three numbers the budget "
+                        "curve's last row already reports. The curve and the "
+                        "miss report have their own switches; with all three "
+                        "off the per-key numbers can be read without running "
+                        "blocking at all.")
     p.add_argument("--candidates", default=None,
                    help="Candidate parquet to score. Defaults to the stage A "
                         "output for this split.")
@@ -1459,7 +1661,24 @@ def main() -> None:
             p.error(f"{paths.normalized_parquet(a.split, s, work)} missing — run "
                     f"`python -m src.main --split {a.split} --normalize-only` first.")
 
-    if not a.no_candidate_recall:
+    # `--no-candidate-recall` now skips ONLY the candidate-recall section.
+    #
+    # It used to gate the budget curve and the miss report as well, which made
+    # the sweep unusable at a large budget: the curve reads cuts off the
+    # candidate file cheaply, while candidate recall left-joins the whole file
+    # against the true pairs — at budget 200 that is a hash table over ~440M
+    # rows to produce three numbers the curve's last row already reports.
+    # Each section now has its own switch and its own reason to be skipped.
+    sweep = tuple(
+        sorted({int(c) for c in a.cap_sweep.split(",") if c.strip()})
+    )
+    cuts = tuple(
+        sorted({int(c) for c in a.budget_curve.split(",") if c.strip()})
+    )
+    wants_candidates = (
+        not a.no_candidate_recall or bool(cuts) or not a.no_miss_report
+    )
+    if wants_candidates:
         cand_path = (
             Path(a.candidates).expanduser() if a.candidates
             else paths.candidates_parquet(a.split, work)
@@ -1467,12 +1686,11 @@ def main() -> None:
         if not cand_path.is_file():
             p.error(f"{cand_path} missing — run "
                     f"`python -m src.blocking --split {a.split}` first, or pass "
-                    "--no-candidate-recall for the per-key numbers alone.")
-        with progress.stage("eval/candidate-recall", budget=a.budget):
-            candidate_recall(a.split, work, data, cand_path, a.budget)
-        cuts = tuple(
-            sorted({int(c) for c in a.budget_curve.split(",") if c.strip()})
-        )
+                    "--no-candidate-recall --budget-curve '' --no-miss-report "
+                    "for the per-key numbers alone.")
+        if not a.no_candidate_recall:
+            with progress.stage("eval/candidate-recall", budget=a.budget):
+                candidate_recall(a.split, work, data, cand_path, a.budget)
         if cuts:
             with progress.stage("eval/budget-curve", cuts=len(cuts)):
                 budget_curve(a.split, work, data, cand_path, cuts)
@@ -1493,7 +1711,7 @@ def main() -> None:
         with progress.stage("eval/key-diagnostics"):
             key_diagnostics(a.split, work, data, a.max_bucket, a.sample_pairs,
                             a.acronym_cap, a.band_cap, a.acronym_min_len,
-                            a.token_cap)
+                            a.token_cap, sweep)
     progress.shutdown()
 
 

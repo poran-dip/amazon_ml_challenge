@@ -128,6 +128,12 @@ BAND_KEYS: tuple[str, ...] = minhash.band_columns(N_BANDS)
 BAND_WEIGHT = 0.10
 BAND_CAP = 100
 
+# The emit guards' defaults, as constants rather than argparse literals, so
+# `block_eval`'s cap sweep can say which caps blocking would REFUSE instead of
+# printing a cost the reader has to compare against a number in another file.
+MAX_PAIRS_PER_KEY_DEFAULT = 400_000_000
+MAX_PAIRS_TOTAL_DEFAULT = 1_500_000_000
+
 # Default bucket cap for the token keys. Tighter than the name keys' 2,000 by
 # two orders of magnitude, because a token key's fan-out is multiplied by the
 # number of tokens per record and because its whole purpose is the RARE
@@ -504,6 +510,21 @@ def projected_pairs(s1: pl.DataFrame, census: pl.DataFrame) -> int:
     """
     if s1.is_empty() or census.is_empty():
         return 0
+    # `s1` is the RAW per-row frame, one row per (record, bucket) — NOT a
+    # census. This function does its own counting, so handing it a frame that
+    # is already one row per bucket makes every `n_s1` come back as 1 and the
+    # result collapses from `sum(n_s1 * bucket_size)` to `sum(bucket_size)`.
+    # That is a silent 100x-1000x under-estimate of a number whose entire job
+    # is to be an upper bound, and it is exactly what `block_eval`'s first cap
+    # sweep did: it reported 41.7M raw pairs for a configuration that projects
+    # 15.0 BILLION, and the run was started on the strength of it.
+    #
+    # NOT enforced with a check here. "One row per bucket" is a heuristic, and
+    # it is legitimately true whenever every source-1 record has a distinct key
+    # value — which is the normal case on a small `--sample` run. A guard on it
+    # refused a valid six-row fixture the moment it was added. The fix is that
+    # a caller holding counts computes the product itself; see the cap sweep in
+    # `block_eval`, which does.
     counts = s1.group_by("bk").len().rename({"len": "n_s1"})
     return int(
         counts.join(census, on="bk", how="inner")
@@ -1307,7 +1328,7 @@ def main() -> None:
         "reads off one normalization pass. Mutually exclusive with --keys.",
     )
     p.add_argument(
-        "--max-pairs-total", type=int, default=1_500_000_000,
+        "--max-pairs-total", type=int, default=MAX_PAIRS_TOTAL_DEFAULT,
         help="Refuse a key set projected to emit more than this many raw "
         "pairs in total (default: %(default)s, roughly 12GB of partials). "
         "Checked as the plan accumulates, so it stops after a few keys rather "
@@ -1316,7 +1337,7 @@ def main() -> None:
         "sixteen of them come to 3.4 billion. 0 disables.",
     )
     p.add_argument(
-        "--max-pairs-per-key", type=int, default=400_000_000,
+        "--max-pairs-per-key", type=int, default=MAX_PAIRS_PER_KEY_DEFAULT,
         help="Refuse to emit a key projected to produce more than this many "
         "raw pairs (default: %(default)s). The projection is EXACT and costs "
         "a one-row aggregation, so this fails in seconds instead of an hour. "
@@ -1397,7 +1418,13 @@ def main() -> None:
         f"global {a.max_bucket}"
         if a.max_bucket
         else ", ".join(
-            f"{k}={a.acronym_cap or c if k == 'name_acronym' else c}"
+            # The banner has to print the cap the run will USE. It listed the
+            # KEY_SPECS default for every key but `name_acronym`, so
+            # `--token-cap 20000` printed `name_tokens=40` directly above a
+            # run that used 20,000 — a header describing a run that is not
+            # happening, which is the failure this file's comments are about.
+            f"{k}="
+            f"{a.acronym_cap or c if k == 'name_acronym' else a.token_cap or c if is_token(k) else c}"
             for k, _, c in KEY_SPECS
             if k in exact_sel
         ) + (f", {n_band_sel} bands={a.band_cap or BAND_CAP}" if n_band_sel else "")
