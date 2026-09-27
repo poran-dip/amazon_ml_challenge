@@ -67,6 +67,71 @@ LEGAL_ABBREV: dict[str, str] = {
 # abbreviation and `in`/`io` collide with ordinary words.
 WEB_TOKENS: tuple[str, ...] = ("www", "com", "net", "org", "edu", "gov", "info", "biz")
 
+# France-only overlays.
+#
+# France appears in the TEST split and nowhere in training, so nothing here can
+# be measured against the ground truth — which is exactly why both tables are
+# gated on the country rather than applied globally. A gated rule cannot change
+# a single US or India record, so the worst case is that it does nothing, and
+# the blast radius of a wrong entry is confined to the country it was written
+# for. Applied globally, `ste -> sainte` alone would rewrite every US "Suite".
+#
+# Legal forms, dropped from `name_core` the way LEGAL_TOKENS are. Only pure
+# form markers: `groupe`, `entreprise` and `freres` are NOT here because they
+# distinguish one business from another.
+FRENCH_LEGAL_TOKENS: tuple[str, ...] = (
+    "societe", "ste", "soc", "sasu", "snc", "sci", "scp", "scm",
+    "selarl", "selas", "selafa", "eurl", "eirl", "scs", "sca", "scop",
+    "scic", "gie", "geie", "sem", "seml", "association", "assoc",
+    "etablissements", "etablissement", "ets", "compagnie", "cie",
+    "cooperative", "mutuelle", "syndicat",
+    # The French `and`/`of`/`the`, which LEGAL_TOKENS already drops in
+    # English. Without these, `Ets Martin et Cie` and `Martin` differ by a
+    # token that carries no information.
+    "et", "de", "des", "du", "la", "le", "les", "aux",
+)
+
+# Street-type and building abbreviations. `av`, `pl` and `sq` are already in
+# ADDR_ABBREV and mean the same thing in both languages, so they are not
+# repeated. `r` (rue), `all` (allee) and `rd` are deliberately absent: one
+# letter is too short to disambiguate, `all` is an English word, and `rd`
+# already means road.
+#
+# `ste` is an OVERRIDE, not an addition. ADDR_ABBREV maps it to `suite`, which
+# is right for the US and wrong for France, where it is Sainte in a street
+# name. The override only works because this table runs BEFORE the global one
+# on French rows — `_expand` replaces whole tokens, so once the global pass has
+# turned `ste` into `suite` there is nothing left for a later pass to match.
+# Applying it second, which is what the first version did, silently left every
+# French `Ste Anne` as `suite anne`.
+FRENCH_ADDR_ABBREV: dict[str, str] = {
+    "bd": "boulevard", "bld": "boulevard", "boul": "boulevard",
+    "imp": "impasse",
+    "che": "chemin", "chem": "chemin",
+    "rte": "route",
+    "fg": "faubourg", "fbg": "faubourg",
+    "crs": "cours",
+    "res": "residence", "resid": "residence",
+    "bat": "batiment", "batim": "batiment",
+    "appt": "appartement", "app": "appartement",
+    "etg": "etage",
+    "bp": "boite postale",
+    "zi": "zone industrielle", "za": "zone activite",
+    "rpt": "rond point",
+    "lieudit": "lieu dit",
+    "sainte": "sainte", "ste": "sainte",
+}
+
+# What `country_norm` looks like for France after `_base_clean`. Matched as a
+# set rather than a substring, so a locality that merely contains the letters
+# is unaffected.
+FRANCE_LABELS: frozenset[str] = frozenset({"france", "fr", "fra"})
+
+
+def _is_france(col: str = "country") -> pl.Expr:
+    return _base_clean(pl.col(col)).is_in(list(FRANCE_LABELS))
+
+
 # Tokens stripped to form `name_core`. Pure legal-form markers only: words like
 # "group" or "holdings" are NOT here because they distinguish real businesses.
 LEGAL_TOKENS: tuple[str, ...] = (
@@ -492,7 +557,18 @@ def name_expressions(
     base = _base_clean(raw)
     norm = _expand(base, LEGAL_ABBREV)
     core = _drop_tokens(norm, LEGAL_TOKENS + WEB_TOKENS)
+    # France-only second strip. Both branches are computed and then selected,
+    # which is what a conditional expression costs; the alternative is a
+    # separate pass over a filtered frame, and at 12.5M rows the branch is
+    # cheaper than the split and re-concatenation.
+    core = (
+        pl.when(_is_france())
+        .then(_drop_tokens(core, FRENCH_LEGAL_TOKENS))
+        .otherwise(core)
+    )
     # If stripping legal tokens empties the name, fall back to the full form.
+    # Checked AFTER the French strip, so a French company whose entire name is
+    # its legal form still gets the fallback rather than an empty key.
     core = pl.when(core.str.len_chars() == 0).then(norm).otherwise(core)
     nospace = core.str.replace_all(r"\s+", "")
     return [
@@ -500,6 +576,32 @@ def name_expressions(
         core.alias("name_core"),
         _sorted_tokens(core).alias("name_sorted"),
         nospace.alias("name_nospace"),
+        # CHARACTER anagram: despace the whole name, then sort its characters.
+        # `enterprises acme` -> `aceeeeimnprrsst`.
+        #
+        # This is not a sorted-token key with the spaces taken out — that
+        # would give `acmeenterprises` and would still require the two sides
+        # to tokenize the same way. Sorting the characters removes the token
+        # boundaries entirely, which is what reaches the failure class nothing
+        # else does: a name concatenated in a different order.
+        # `Combs and Silverman Navigation` and `navigationcombssilverman.com`
+        # share no token-level key and have a trigram Jaccard of 0.71 — below
+        # the LSH bands' reach — and they are exact anagrams of each other.
+        #
+        # It subsumes a token-sorted-despaced key (equal token multisets imply
+        # equal character multisets), so only this one is kept.
+        #
+        # The cost is collisions: every anagram of a name is now one bucket,
+        # so this is the lossiest name key in the set. It is priced the way
+        # every other key is — the bucket cap drops the values that collide
+        # with everything, and the inverse-frequency term in `block_score`
+        # demotes what survives.
+        #
+        # `str.split("")` splits into single characters; `str.extract_all(".")`
+        # is equivalent and equally fast (both measured at 45s per 12.5M rows,
+        # and verified to agree on the same inputs).
+        nospace.str.split("").list.sort().list.join("")
+        .alias("name_charsort"),
         _acronym(core).alias("name_acronym"),
         core.str.split(" ").list.len().cast(pl.UInt16).alias("name_token_count"),
         _long_tokens(core).alias("name_tokens"),
@@ -520,7 +622,13 @@ def name_expressions(
 
 def address_expressions(col: str = "business_address") -> list[pl.Expr]:
     base = _base_clean(pl.col(col))
-    norm = _expand(base, ADDR_ABBREV)
+    # France-only overlay, applied BEFORE the global table so its `ste` entry
+    # is seen while the token is still `ste`. See FRENCH_ADDR_ABBREV.
+    norm = (
+        pl.when(_is_france())
+        .then(_expand(_expand(base, FRENCH_ADDR_ABBREV), ADDR_ABBREV))
+        .otherwise(_expand(base, ADDR_ABBREV))
+    )
     core = _drop_tokens(norm, ADDR_STOPWORDS)
     digits = pl.col(col).fill_null("").str.extract_all(r"\d+")
     return [
