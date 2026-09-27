@@ -37,3 +37,16 @@ python -m src.model --split train --folds 5 --rounds 1500 --coverage C --train-r
 cd ..\..\student_resource
 python3 utils/validate_submission.py --matching ..\output\matching_results.tsv --candidate ..\output\candidate_pairs.tsv --test-dir dataset/test
 ```
+
+```bash
+python -m src.blocking  --split train --budget 60 --token-cap 500 --merge-buckets 32 --progress
+python -m src.features  --split train --merge-buckets 32 --progress
+python -m src.block_eval --split train --budget 60 --token-cap 500 --no-candidate-recall --no-miss-report --no-key-diagnostics --budget-curve "60"
+
+python -m src.model     --split train --folds 5 --max-folds 3 --coverage R --progress
+
+python -m src.main      --split test --normalize-only --translit --progress
+python -m src.blocking  --split test --budget 60 --token-cap 500 --merge-buckets 32 --progress
+python -m src.features  --split test --merge-buckets 32 --progress
+python -m src.model     --split test --folds 5 --coverage R --progress
+```

@@ -1016,29 +1016,83 @@ def write_candidate_submission(
     therefore produced half a submission, silently, with every stage
     reporting success.
 
-    Grouped LAZILY, unlike `write_submission`, which takes an in-memory frame.
-    The candidate set is ~130M rows at budget 60 and larger above it;
-    collecting it just to group it is several GB spent at the very end of a
-    multi-hour run, which is the one place a failure costs the most.
+    Grouped ONE MERGE BUCKET AT A TIME, and that is not an optimisation.
+    The first version built the whole thing as one lazy plan and called
+    `.collect()`, on the theory that laziness would keep it small. It does
+    not: a `group_by` is a blocking operation, so `collect()` materialises
+    every group before returning, and 131M candidate rows collapsing into
+    2.2M lists of ID strings needs far more than the ~7GB free at the end of
+    a model run. Observed on a 16GB machine: the process fell into swap, CPU
+    dropped to 1%, and the whole desktop froze — no traceback, no OOM, and
+    nothing to distinguish it from a hang.
+
+    Bucketing makes it exact rather than approximate, for the same reason the
+    blocking merge and `select_matches` are bucketed: the candidate file is
+    partitioned by a hash of `source1_entity_id`, so an entity's rows are
+    entirely inside one bucket and per-bucket groups never need re-grouping.
+    Only the JOINED STRING is kept per entity — about 2.2M short strings —
+    not the candidate lists.
     """
-    all_s1 = scan_source(split, 1, data, sample).select("entity_id")
-    grouped = (
-        pl.scan_parquet(cand_path)
-        .group_by("source1_entity_id")
-        .agg(pl.col("candidate_entity_id").unique().sort().alias("ids"))
-        .rename({"source1_entity_id": "entity_id"})
-    )
-    full = (
-        all_s1.join(grouped, on="entity_id", how="left")
-        .with_columns(pl.col("ids").fill_null([]))
-        .select(
-            pl.col("entity_id").alias("source1_entity_id"),
-            pl.col("ids").list.join(",").alias("candidate_entity_ids"),
+    all_s1 = scan_source(split, 1, data, sample).select("entity_id").collect()
+    n_pairs = pl.scan_parquet(cand_path).select(pl.len()).collect().item()
+
+    cols = set(pl.scan_parquet(cand_path).collect_schema().names())
+    if "bucket" in cols:
+        buckets: list = sorted(
+            pl.scan_parquet(cand_path).select("bucket").unique()
+            .collect().to_series().to_list()
         )
-        .collect()
-    )
+    else:
+        # A candidate file written before blocking recorded the column. One
+        # pass, which is the shape that froze the machine — so it says so
+        # rather than doing it quietly.
+        print("    candidate file predates the `bucket` column — grouping it "
+              "in ONE pass, which needs several GB at this size. Re-run "
+              "blocking if this is tight.")
+        buckets = [None]
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with progress.stage(f"write/{out_path.name}") as st:
+    with progress.stage(f"write/{out_path.name}", pairs=n_pairs,
+                        buckets=len(buckets)) as st:
+        tick = st.ticker(len(buckets), unit="buckets", label="candidate tsv")
+        parts: list[pl.DataFrame] = []
+        for b in buckets:
+            lf = pl.scan_parquet(cand_path)
+            if b is not None:
+                lf = lf.filter(pl.col("bucket") == b)
+            part = (
+                lf.select("source1_entity_id", "candidate_entity_id")
+                .group_by("source1_entity_id")
+                .agg(pl.col("candidate_entity_id").unique().sort().alias("ids"))
+                .select(
+                    pl.col("source1_entity_id").alias("entity_id"),
+                    pl.col("ids").list.join(",").alias("candidate_entity_ids"),
+                )
+                .collect()
+            )
+            if not part.is_empty():
+                parts.append(part)
+            tick.advance(1, entities=sum(p.height for p in parts))
+        tick.close()
+
+        grouped = (
+            pl.concat(parts, how="vertical") if parts
+            else pl.DataFrame(schema={"entity_id": pl.Utf8,
+                                      "candidate_entity_ids": pl.Utf8})
+        )
+        del parts
+        # Every source-1 entity must appear exactly once, with an empty field
+        # when blocking found nothing for it — a missing entity is rejected
+        # outright by the scorer.
+        full = (
+            all_s1.join(grouped, on="entity_id", how="left")
+            .with_columns(pl.col("candidate_entity_ids").fill_null(""))
+            .select(
+                pl.col("entity_id").alias("source1_entity_id"),
+                pl.col("candidate_entity_ids"),
+            )
+        )
+        st.set(grouped_rows=full.height)
         full.write_csv(out_path, separator="\t", include_header=True,
                        quote_style="never")
         st.set(rows=full.height,

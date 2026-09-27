@@ -858,6 +858,12 @@ def main() -> None:
                    help="Boosting round ceiling. Early stopping on an inner "
                         "slice of the training folds usually stops first.")
     p.add_argument("--seed", type=int, default=13)
+    p.add_argument(
+        "--candidates-tsv", action="store_true",
+        help="Also write candidate_pairs.tsv on --split train. Off by "
+        "default: it is a submission artefact, the training copy is never "
+        "submitted, and building it is a group-by over every candidate pair.",
+    )
     p.add_argument("--max-folds", type=int, default=None,
                    help="Train only the first N of --folds folds. "
                         "`--folds 5 --max-folds 1` is an 80:20 grouped split "
@@ -901,19 +907,13 @@ def main() -> None:
         pairs.rename({ENT: "entity_id"}), a.split, data, None,
         out / "matching_results.tsv", "matched_entity_ids",
     )
-    # BOTH deliverables, from the stage that finishes the run.
+    # The SCORE comes before the candidate file, deliberately.
     #
-    # `candidate_pairs.tsv` used to be written only by the `src.main` CLI, so
-    # the staged path — blocking, features, then this module — produced a
-    # submission with one of its two files missing and said nothing about it.
-    cand_path = paths.candidates_parquet(a.split, work)
-    if cand_path.is_file():
-        pipeline.write_candidate_submission(
-            cand_path, a.split, data, out / "candidate_pairs.tsv",
-        )
-    else:
-        print(f"  WARNING: {cand_path} is missing, so candidate_pairs.tsv was "
-              "NOT written. The submission is incomplete.")
+    # It used to come after, and the candidate write takes minutes on a
+    # hundred-million-row candidate set — so the one number the training run
+    # exists to produce was gated behind the one artefact a training run does
+    # not need. Interrupting the write to get on with the test split threw
+    # away the score.
     if a.split == "train":
         score = pipeline.macro_f05(preds, data, "matched_entity_ids",
                                    restrict_to=scored_entities)
@@ -923,6 +923,26 @@ def main() -> None:
         if scored_entities is not None:
             print(f"  over {scored_entities.height:,} held-out entities only; "
                   f"{out / 'matching_results.tsv'} is NOT a valid submission")
+
+    # `candidate_pairs.tsv` is a SUBMISSION artefact, so it is written for the
+    # split that gets submitted. The training split's copy is never sent
+    # anywhere, and building it costs a group-by over every candidate pair —
+    # minutes, at the end of the run, for a file nobody reads.
+    #
+    # It was written unconditionally, which is how a training run came to
+    # spend its last five minutes on that instead of on the score above.
+    # `--candidates-tsv` forces it if a training copy is genuinely wanted.
+    cand_path = paths.candidates_parquet(a.split, work)
+    if a.split == "train" and not a.candidates_tsv:
+        print("  candidate_pairs.tsv skipped for --split train (not a "
+              "submission artefact). Pass --candidates-tsv to write it.")
+    elif cand_path.is_file():
+        pipeline.write_candidate_submission(
+            cand_path, a.split, data, out / "candidate_pairs.tsv",
+        )
+    else:
+        print(f"  WARNING: {cand_path} is missing, so candidate_pairs.tsv was "
+              "NOT written. The submission is incomplete.")
     print(f"  done in {time.perf_counter() - started:.1f}s")
     progress.shutdown()
 
