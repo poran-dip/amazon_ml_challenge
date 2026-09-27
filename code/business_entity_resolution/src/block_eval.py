@@ -710,7 +710,17 @@ def _token_cap_sweep(
          for s in (2, 3)],
         how="vertical",
     )
-    census: dict[str, tuple[pl.DataFrame, pl.DataFrame]] = {}
+    # (bucket, source-1 rows in it, target rows in it) per key, once. Every
+    # cap is then a filter and a sum over this.
+    #
+    # The product is written out here rather than delegated to
+    # `blocking.projected_pairs`, which counts its own rows and therefore
+    # needs the raw per-row frame. Handing it these counts made every `n_s1`
+    # read as 1, so the cost column reported `sum(bucket_size)` instead of
+    # `sum(n_s1 * bucket_size)` — 41.7M for a configuration that projects
+    # 15.0 BILLION, and a blocking run was started on the strength of it.
+    # `projected_pairs` now refuses a pre-aggregated frame outright.
+    sized: dict[str, pl.DataFrame] = {}
     for key in tokens:
         tgt = (
             blocking._maybe_explode(
@@ -718,20 +728,30 @@ def _token_cap_sweep(
             .filter(blocking._usable(key))
             .select(blocking.blocking_key(key))
             .group_by("bk").len().rename({"len": "bucket_size"})
-            .collect()
         )
         src = (
             blocking._maybe_explode(s1_lf.select("country_norm", key), key)
             .filter(blocking._usable(key))
             .select(blocking.blocking_key(key))
             .group_by("bk").len().rename({"len": "n_s1"})
+        )
+        sized[key] = (
+            src.join(tgt, on="bk", how="inner")
+            .select(
+                pl.col("bucket_size").cast(pl.Int64),
+                (pl.col("n_s1").cast(pl.Int64)
+                 * pl.col("bucket_size").cast(pl.Int64)).alias("pairs"),
+            )
             .collect()
         )
-        census[key] = (src, tgt)
 
+    per_key_limit = blocking.MAX_PAIRS_PER_KEY_DEFAULT
     _section("token cap sweep — the CEILING a budget sweep runs into")
-    print(f"{'token cap':>10} {'UNION at cap':>14} {'unreachable':>12} "
-          f"{'raw pairs (token keys)':>24}")
+    head = f"{'token cap':>10} {'UNION at cap':>13} {'unreachable':>12}"
+    for key in tokens:
+        head += f" {key:>16}"
+    head += f" {'TOTAL':>17}"
+    print(head)
     for cap in cuts:
         reach = pl.any_horizontal(
             [other_usable]
@@ -742,23 +762,35 @@ def _token_cap_sweep(
             ]
         )
         union = int(base.select(reach.sum()).item())
-        cost = 0
+        row = (f"{cap:>10,} {union / total:>12.2%} "
+               f"{1 - union / total:>11.2%}")
+        grand = 0
+        over = False
         for key in tokens:
-            src, tgt = census[key]
-            cost += blocking.projected_pairs(
-                src.rename({"n_s1": "len"}).with_columns(
-                    pl.col("len").alias("n_s1")
-                ).select("bk", "n_s1"),
-                tgt.filter(pl.col("bucket_size") <= cap),
+            cost = int(
+                sized[key].filter(pl.col("bucket_size") <= cap)
+                .select(pl.col("pairs").sum()).item() or 0
             )
-        print(f"{cap:>10,} {union / total:>13.2%} "
-              f"{1 - union / total:>11.2%} {cost:>24,}")
+            grand += cost
+            flag = "!" if cost > per_key_limit else " "
+            row += f" {cost:>15,}{flag}"
+            over = over or cost > per_key_limit
+        row += f" {grand:>17,}"
+        if over:
+            row += "  <- REFUSED"
+        print(row)
     print("\n  UNION at cap is the hard ceiling on PAIR RECALL for a blocking")
     print("  run at that cap. A larger --budget cannot pass it: the budget")
     print("  chooses among candidates that were generated, and these were not.")
-    print("  The cost column is the token keys' raw emitted pairs, exact, and")
-    print("  is what --max-pairs-per-key / --max-pairs-total are checked")
-    print("  against. Pick the knee, then sweep the budget under it.")
+    print("  The per-key columns are EXACT raw emitted pairs — the same number")
+    print("  `_emit_key` computes and refuses on. A `!` means that key alone")
+    print(f"  exceeds --max-pairs-per-key ({per_key_limit:,}), so blocking will")
+    print("  abort on it; the run's other keys are emitted first and wasted.")
+    print("  Fan-out here is sum(source-1 rows in bucket x target rows in it),")
+    print("  so it grows with the SQUARE of bucket size, not linearly — which")
+    print("  is why these numbers explode far faster than the recall column")
+    print("  improves. Pick the largest cap that is not refused, then sweep")
+    print("  the budget under it.")
 
 
 def key_diagnostics(
