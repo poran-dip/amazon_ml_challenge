@@ -57,8 +57,11 @@ A pair can be `usable` there and still be absent here, evicted by the budget.
     loudly rather than folded into `budget-evicted`, where it would look like
     a reason to raise the budget.
 
-It then prints `--show-misses` of them in full, with the raw name and address
-of both sides and the candidates blocking kept instead.
+It then prints `--show-misses` of them in full — by default the
+`no-key-agrees` ones, since every other reason is already actionable from the
+table and that one is not. Each shows the raw AND normalized name and address
+of both sides, the trigram Jaccard and containment, and what blocking returned
+for that entity instead. `--miss-reason` picks a different bucket.
 
 Usage:
 
@@ -68,7 +71,11 @@ Usage:
     # the flags BLOCKING ran with have to be repeated, or the attribution
     # describes a run that never happened
     python -m src.block_eval --split train --budget 60 --band-cap 100 \
-        --band-min-hits 2 --show-misses 20 --miss-order worst
+        --band-min-hits 2 --show-misses 20
+
+    # the near-misses alone, or a different bucket
+    python -m src.block_eval --split train --miss-order most-similar
+    python -m src.block_eval --split train --miss-reason bucket-cap
 """
 
 from __future__ import annotations
@@ -702,6 +709,15 @@ def key_diagnostics(
 #
 # The ordering is also the fix ordering. Everything above `budget` needs a
 # change to blocking's reach; `budget` alone is a number.
+# Trigram-Jaccard strata. ONE definition, used both by the similarity
+# breakdown under the reason table and by `--miss-order stratified`, so the
+# bands a reader is shown a cross-section of are the bands they were just
+# given counts for. Two copies would drift, and the drift would be invisible:
+# both would still print four plausible rows.
+SIMILARITY_BANDS: tuple[tuple[float, float], ...] = (
+    (0.8, 1.01), (0.5, 0.8), (0.2, 0.5), (0.0, 0.2),
+)
+
 MISS_REASONS: tuple[str, ...] = (
     "country-mismatch",   # keys are country-partitioned, so nothing can fire
     "no-key-agrees",      # every key disagrees: only a NEW key helps
@@ -774,6 +790,7 @@ def miss_report(
     max_bucket: int | None, acronym_cap: int | None, band_cap: int | None,
     acronym_min_len: int, band_min_hits: int, keys: tuple[str, ...] | None,
     n_examples: int, order: str, seed: int, sample_pairs: int | None = None,
+    reason_filter: str = "no-key-agrees",
 ) -> None:
     """Classify every missed true pair, then print `n_examples` of them.
 
@@ -833,15 +850,16 @@ def miss_report(
               "them; the percentages below are over the sample.")
 
     # The extra columns the sub-diagnosis reads. `name_trigrams` is not a
-    # blocking key, so `annotate_agreement` leaves it alone; `name_sorted` is
-    # one and gets consumed, so it is copied below before the pass runs.
+    # blocking key, so `annotate_agreement` leaves it alone; `name_sorted` and
+    # `addr_sorted` are, and get consumed, so both are copied before the pass.
     extra = ["name_trigrams"]
-    # `name_sorted` is read as a VALUE (the empty-name check) as well as being
-    # a key, and a `--keys` subset that leaves it out would otherwise make this
-    # section fail on a column blocking never needed. Requested explicitly and
-    # deduplicated, rather than assumed to be in `selected`.
+    # Both are read as VALUES as well as being keys, and a `--keys` subset that
+    # leaves one out would otherwise make this section fail on a column
+    # blocking never needed. Requested explicitly and deduplicated, rather than
+    # assumed to be in `selected`.
     cols = list(dict.fromkeys(
-        ["entity_id", "country_norm", *selected, "name_sorted", *extra]
+        ["entity_id", "country_norm", *selected, "name_sorted", "addr_sorted",
+         *extra]
     ))
     s1 = pl.scan_parquet(paths.normalized_parquet(split, 1, work)).select(cols)
     others = pl.concat(
@@ -854,12 +872,21 @@ def miss_report(
     base = (
         missed.lazy()
         .join(s1, left_on="source1_entity_id", right_on="entity_id", how="inner")
-        # Copied BEFORE the agreement pass, which consumes every key column
-        # including `name_sorted` itself.
-        .with_columns(pl.col("name_sorted").alias("_ns"))
+        # Copied BEFORE the agreement pass, which consumes every key column.
+        # The NORMALIZED forms are what the examples have to show next to the
+        # raw strings: when no key agrees, the question is always whether the
+        # two records are genuinely different or whether normalization pulled
+        # them apart, and only the normalized pair answers it.
+        .with_columns(
+            pl.col("name_sorted").alias("_ns"),
+            pl.col("addr_sorted").alias("_as"),
+        )
         .join(others, left_on="candidate_entity_id", right_on="entity_id",
               how="inner", suffix="_r")
-        .with_columns(pl.col("name_sorted_r").alias("_ns_r"))
+        .with_columns(
+            pl.col("name_sorted_r").alias("_ns_r"),
+            pl.col("addr_sorted_r").alias("_as_r"),
+        )
         .collect()
     )
     if base.is_empty():
@@ -1030,8 +1057,7 @@ def miss_report(
         # substring test would also need `str.contains` against a COLUMN
         # pattern, which is a different and less portable thing to depend on.
         cont = int(hard.select((pl.col("tri_cont") >= 0.9).sum()).item())
-        bins = [(0.8, 1.01), (0.5, 0.8), (0.2, 0.5), (0.0, 0.2)]
-        for lo, hi in bins:
+        for lo, hi in SIMILARITY_BANDS:
             n = int(
                 hard.select(
                     ((pl.col("tri_jac") >= lo) & (pl.col("tri_jac") < hi)).sum()
@@ -1054,16 +1080,71 @@ def miss_report(
     if n_examples <= 0:
         return
 
-    # Ordered per ENTITY rather than per pair, because a miss is only readable
-    # next to the entity's other true matches and the candidates that displaced
-    # them.
-    per_entity = (
-        base.group_by("source1_entity_id")
-        .agg(pl.len().alias("n_missed"), pl.col("_n_cand").first())
-    )
-    if order == "worst":
-        # Entities that scored a FLAT ZERO: every true match missed. These are
-        # the ones the macro average is most sensitive to, and they are not the
+    # Filtered to ONE reason, and by default to `no-key-agrees`.
+    #
+    # The other five reasons are already actionable from the table above: a
+    # `bucket-cap` miss says loosen that cap, a `budget-evicted` miss says
+    # raise the budget, a `country-mismatch` miss says relax the partition.
+    # None of them needs to be read. `no-key-agrees` is the only bucket where
+    # the table cannot tell you what to do, because the answer is "some key
+    # that does not exist yet" and the only way to find out which is to look
+    # at the pairs. So that is what this prints unless asked otherwise.
+    if reason_filter != "any":
+        ex_pool = base.filter(pl.col("reason") == reason_filter)
+        if ex_pool.is_empty():
+            print(f"\n  (no `{reason_filter}` misses to show; "
+                  "--miss-reason any prints from all of them)")
+            return
+    else:
+        ex_pool = base
+
+    # Ordered so that twenty rows SPAN the range rather than land in one
+    # corner of it.
+    #
+    # This matters more than it looks. Sorted by similarity the first twenty
+    # `no-key-agrees` misses are all near-duplicates and the reader concludes
+    # "one prefix key fixes everything"; sampled at random from a distribution
+    # that is mostly J < 0.2 they are all hopeless and the reader concludes
+    # "this needs a different method". Both conclusions are drawn from the
+    # sort order rather than from the data. `stratified` takes an equal share
+    # from each similarity band, so the printout is a cross-section and the
+    # TABLE above stays the thing that says how common each band is.
+    if order == "stratified":
+        per_band = max(1, n_examples // len(SIMILARITY_BANDS))
+        parts = []
+        for lo, hi in SIMILARITY_BANDS:
+            part = ex_pool.filter(
+                (pl.col("tri_jac") >= lo) & (pl.col("tri_jac") < hi)
+            ).sort("tri_jac", descending=True)
+            parts.append(part.head(per_band))
+        picked = pl.concat(parts, how="vertical")
+        # Bands can be empty or short, so the quota is a floor and the
+        # remainder is topped up MOST-SIMILAR FIRST rather than at random.
+        # That bias is deliberate: once every band is represented, the rows
+        # worth spending the rest of the page on are the near-misses, because
+        # those are the ones a new key could plausibly reach.
+        if picked.height < n_examples:
+            rest = ex_pool.join(
+                picked.select("source1_entity_id", "candidate_entity_id"),
+                on=["source1_entity_id", "candidate_entity_id"], how="anti",
+            ).sort("tri_jac", descending=True)
+            picked = pl.concat([picked, rest.head(n_examples - picked.height)],
+                               how="vertical")
+        picked = picked.sort("tri_jac", descending=True).head(n_examples)
+    elif order == "most-similar":
+        picked = ex_pool.sort("tri_jac", descending=True).head(n_examples)
+    elif order == "most-missed":
+        counts_e = (
+            ex_pool.group_by("source1_entity_id").len()
+            .rename({"len": "_n_miss_e"})
+        )
+        picked = (
+            ex_pool.join(counts_e, on="source1_entity_id", how="left")
+            .sort(["_n_miss_e", "source1_entity_id"], descending=[True, False])
+            .head(n_examples)
+        )
+    elif order == "worst":
+        # Entities that scored a FLAT ZERO: every true match missed. Not the
         # same set as "missed the most" — an entity missing 4 of 5 is a worse
         # miss count and a better score than one missing its only match.
         n_true_e = (
@@ -1071,87 +1152,93 @@ def miss_report(
             .group_by("source1_entity_id").len().rename({"len": "n_true"})
             .collect()
         )
-        per_entity = (
-            per_entity.join(n_true_e, on="source1_entity_id", how="left")
+        n_miss_e = (
+            base.group_by("source1_entity_id").len()
+            .rename({"len": "_n_miss_e"})
+        )
+        picked = (
+            ex_pool.join(n_true_e, on="source1_entity_id", how="left")
+            .join(n_miss_e, on="source1_entity_id", how="left")
             .with_columns(
-                (pl.col("n_true") - pl.col("n_missed")).alias("_found")
+                (pl.col("n_true") - pl.col("_n_miss_e")).alias("_found")
             )
             .sort(["_found", "n_true"], descending=[False, True])
+            .head(n_examples)
         )
-    elif order == "most-missed":
-        per_entity = per_entity.sort("n_missed", descending=True)
     else:
-        per_entity = per_entity.sample(
-            n=min(per_entity.height, n_examples * 4), seed=seed, shuffle=True
-        )
+        picked = ex_pool.sample(
+            n=min(ex_pool.height, n_examples), seed=seed, shuffle=True
+        ).sort("tri_jac", descending=True)
 
-    chosen: list[str] = []
-    shown = 0
-    for eid, n_missed in per_entity.select(
-        "source1_entity_id", "n_missed"
-    ).iter_rows():
-        if shown >= n_examples:
-            break
-        chosen.append(eid)
-        shown += n_missed
-    ex = base.filter(pl.col("source1_entity_id").is_in(chosen))
+    # Grouped by entity for DISPLAY only. The selection above is per pair, so
+    # `--show-misses 20` prints exactly twenty pairs — the earlier version
+    # added a whole entity at a time and overshot.
+    ent_order: list[str] = []
+    for eid in picked["source1_entity_id"].to_list():
+        if eid not in ent_order:
+            ent_order.append(eid)
 
-    # The candidates blocking DID return for these entities, which is what a
-    # `budget-evicted` miss lost to. Read for the chosen entities only.
     got = (
         pl.scan_parquet(cand_path)
-        .filter(pl.col("source1_entity_id").is_in(chosen))
+        .filter(pl.col("source1_entity_id").is_in(ent_order))
         .select("source1_entity_id", "candidate_entity_id", "block_score",
                 "n_keys")
         .collect()
         .sort("block_score", descending=True)
     )
-
-    ids_left = ex["source1_entity_id"].unique().to_list()
-    ids_right = list(
-        set(ex["candidate_entity_id"].to_list())
-        | set(got["candidate_entity_id"].to_list())
+    raw_l = _raw_lookup(split, data, (1,), ent_order)
+    raw_r = _raw_lookup(
+        split, data, (2, 3),
+        picked["candidate_entity_id"].to_list()
+        + got["candidate_entity_id"].to_list(),
     )
-    raw_l = _raw_lookup(split, data, (1,), ids_left)
-    raw_r = _raw_lookup(split, data, (2, 3), ids_right)
 
     agree_cols = [f"_agree_{k}" for k in selected]
-    # `ex.height`, not `n_examples`: the loop above stops once the requested
-    # count is reached but adds a whole entity at a time, so the number printed
-    # is the number of pairs actually below, not the number asked for.
-    _section(f"{ex.height} missed pairs across {len(chosen)} entities "
-             f"(--miss-order {order}, asked for {n_examples})")
-    for eid in chosen:
-        rows = ex.filter(pl.col("source1_entity_id") == eid)
-        if rows.is_empty():
-            continue
+    label_reason = "" if reason_filter == "any" else f"`{reason_filter}` "
+    _section(f"{picked.height} {label_reason}misses across "
+             f"{len(ent_order)} entities (--miss-order {order})")
+    if reason_filter == "no-key-agrees":
+        print("Normalized forms are shown under the raw ones: when no key "
+              "agrees,\nthe question is whether the records really differ or "
+              "whether\nnormalization pulled them apart, and only the "
+              "normalized pair says.\n")
+    for eid in ent_order:
+        rows = picked.filter(pl.col("source1_entity_id") == eid)
         name, addr, country = raw_l.get(eid, ("<not in source1>", "", ""))
+        n_cand = int(rows["_n_cand"][0])
         print(f"\n{'-' * 70}")
         print(f"source1 {eid}  [{country}]")
         print(f"  name : {name}")
+        print(f"  norm : {rows['_ns'][0]}")
         print(f"  addr : {addr}")
-        print(f"  blocking returned {int(rows['_n_cand'][0])} candidates"
-              f"{' (AT the cap)' if int(rows['_n_cand'][0]) >= file_cap else ''}"
-              f", missed {rows.height} true match(es)")
+        print(f"  anorm: {rows['_as'][0]}")
+        print(f"  blocking returned {n_cand} candidates"
+              f"{' (AT the cap)' if n_cand >= file_cap else ''}")
         for r in rows.iter_rows(named=True):
             cid = r["candidate_entity_id"]
             cname, caddr, ccountry = raw_r.get(cid, ("<not in source2/3>", "", ""))
-            agreed = [
-                k for k, c in zip(selected, agree_cols) if r[c]
-            ]
+            agreed = [k for k, c in zip(selected, agree_cols) if r[c]]
             band_agreed = sum(1 for k in agreed if blocking.is_band(k))
             shown_keys = [k for k in agreed if not blocking.is_band(k)]
             if band_agreed:
                 shown_keys.append(f"{band_agreed} band(s)")
             print(f"  MISSED {cid}  [{ccountry}]  reason={r['reason']}  "
-                  f"trigram J={r['tri_jac']:.2f}")
+                  f"trigram J={r['tri_jac']:.2f} cont={r['tri_cont']:.2f}")
             print(f"    name : {cname}")
+            print(f"    norm : {r['_ns_r']}")
             print(f"    addr : {caddr}")
+            print(f"    anorm: {r['_as_r']}")
             print(f"    keys agreeing: "
                   f"{', '.join(shown_keys) if shown_keys else 'NONE'}")
+        # What blocking returned instead. For a `no-key-agrees` miss this is
+        # not what displaced the true match — nothing displaced it, it was
+        # never generated — but it is still the fastest way to see what the
+        # keys DID fire on for this entity, which is half of why they missed.
         top = got.filter(pl.col("source1_entity_id") == eid).head(3)
         if not top.is_empty():
-            print("    kept instead (top 3 by block_score):")
+            label = ("also returned" if reason_filter == "no-key-agrees"
+                     else "kept instead")
+            print(f"    {label} (top 3 by block_score):")
             for g in top.iter_rows(named=True):
                 gname = raw_r.get(g["candidate_entity_id"], ("?", "", ""))[0]
                 print(f"      {g['block_score']:.3f}  n_keys={g['n_keys']}  "
@@ -1207,12 +1294,28 @@ def main() -> None:
         "instead (default: %(default)s). 0 skips the whole section.",
     )
     p.add_argument(
-        "--miss-order", default="worst",
-        choices=("worst", "most-missed", "random"),
-        help="Which misses to print. `worst` takes entities that found NONE "
-        "of their true matches (the flat zeroes in the macro average), "
-        "`most-missed` takes the largest miss counts, `random` samples "
-        "(default: %(default)s).",
+        "--miss-reason", default="no-key-agrees",
+        choices=(*MISS_REASONS, "any"),
+        help="Which kind of miss to print examples of (default: "
+        "%(default)s). The other reasons are already actionable from the "
+        "summary table — a bucket-cap miss says loosen that cap, a "
+        "budget-evicted one says raise the budget. `no-key-agrees` is the "
+        "bucket the table cannot act on, because the answer is a key that "
+        "does not exist yet and the only way to find out which is to read "
+        "the pairs.",
+    )
+    p.add_argument(
+        "--miss-order", default="stratified",
+        choices=("stratified", "most-similar", "worst", "most-missed",
+                 "random"),
+        help="Which of them to print (default: %(default)s). `stratified` "
+        "takes an equal share from each trigram-similarity band, so twenty "
+        "rows span the range instead of landing in one corner of it — "
+        "sorted by similarity they would all be near-duplicates, sampled at "
+        "random they would all be hopeless, and either way the conclusion "
+        "comes from the sort order rather than the data. `most-similar` is "
+        "the near-misses alone, `worst` the entities that found none of "
+        "their true matches, `most-missed` the largest miss counts.",
     )
     p.add_argument("--seed", type=int, default=0,
                    help="Sampling seed for --miss-order random.")
@@ -1295,7 +1398,7 @@ def main() -> None:
                     a.split, work, data, cand_path, a.max_bucket,
                     a.acronym_cap, a.band_cap, a.acronym_min_len,
                     a.band_min_hits, keys, a.show_misses, a.miss_order,
-                    a.seed, a.sample_pairs,
+                    a.seed, a.sample_pairs, a.miss_reason,
                 )
 
     if not a.no_key_diagnostics:
