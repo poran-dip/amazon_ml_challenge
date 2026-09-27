@@ -463,6 +463,7 @@ def budget_curve(
 
 def resolve_caps(
     max_bucket: int | None, acronym_cap: int | None, band_cap: int | None,
+    token_cap: int | None = None,
 ) -> dict[str, int]:
     """Every key's effective bucket cap, as BLOCKING would have applied it.
 
@@ -478,9 +479,82 @@ def resolve_caps(
             return acronym_cap
         if blocking.is_band(key) and band_cap:
             return band_cap
+        if blocking.is_token(key) and token_cap:
+            return token_cap
         return default
 
     return {k: _cap(k, c) for k, _, c in blocking.KEY_SPECS}
+
+
+def _annotate_token_keys(
+    base: pl.DataFrame, others: pl.LazyFrame, keys: list[str],
+    caps: dict[str, int],
+) -> pl.DataFrame:
+    """`_agree_<key>` / `_usable_<key>` for the multi-valued keys.
+
+    A token key holds a LIST, so agreement is not equality: the pair agrees if
+    the two lists intersect at all, and it is USABLE if at least one shared
+    token sits in a target bucket within the cap. The second half is the part
+    that cannot be done with a column comparison — one shared token can be
+    `road` (a bucket of millions, dropped) while another is `boag` (a bucket
+    of two, kept), and the pair is reachable on the strength of the second
+    alone. So the intersection is exploded, priced against the same census
+    blocking builds, and folded back to one boolean per pair.
+
+    `_row` is positional and is dropped before returning. Joining back on
+    (source1_entity_id, candidate_entity_id) would be wrong here: an entity
+    can appear against the same candidate more than once in a sampled frame,
+    and a key join would then fan the frame out rather than annotate it.
+    """
+    base = base.with_row_index("_row")
+    for key in keys:
+        sizes = (
+            # `empty_as_null=False` for the reason `blocking._maybe_explode`
+            # gives: an empty token list must contribute no bucket, and that
+            # should not rest on a default polars is about to change.
+            others.explode(key, empty_as_null=False)
+            .filter(pl.col(key).is_not_null() & (pl.col(key).str.len_chars() > 0))
+            .select(blocking.blocking_key(key))
+            .group_by("bk").len().collect()
+        )
+        shared = pl.col(key).list.set_intersection(pl.col(f"{key}_r"))
+        base = base.with_columns(shared.alias("_shared"))
+        # Exploded to one row per shared token, priced, and reduced back. The
+        # frame this walks is the intersection only — typically zero to three
+        # tokens per pair — not the two token lists.
+        priced = (
+            base.select("_row", "country_norm_r", "_shared")
+            .explode("_shared", empty_as_null=False)
+            .filter(pl.col("_shared").is_not_null())
+            .with_columns(
+                pl.concat_str([
+                    pl.col("country_norm_r").fill_null(""),
+                    pl.lit("|"),
+                    pl.col("_shared"),
+                ]).alias("bk")
+            )
+            .join(sizes, on="bk", how="left")
+            # A null size means the token is not in the target table at all,
+            # which cannot happen for a token that came from it — filled
+            # defensively rather than letting a null count as usable.
+            .group_by("_row")
+            .agg(pl.col("len").fill_null(10**9).min().alias("_min_size"))
+        )
+        base = (
+            base.with_columns(
+                (pl.col("_shared").list.len() > 0).alias(f"_agree_{key}")
+            )
+            .join(priced, on="_row", how="left")
+            .with_columns(
+                (
+                    pl.col(f"_agree_{key}")
+                    & pl.col("_min_size").fill_null(10**9).le(caps[key])
+                ).alias(f"_usable_{key}")
+            )
+            .drop("_min_size", "_shared", key, f"{key}_r")
+        )
+        del sizes, priced
+    return base.drop("_row")
 
 
 def annotate_agreement(
@@ -532,6 +606,11 @@ def annotate_agreement(
             # caused.
             ok = ok & (pl.col(f"{key}_r").str.len_chars() >= min_len)
         return ok
+
+    token_keys = [k for k in keys if blocking.is_token(k)]
+    if token_keys:
+        base = _annotate_token_keys(base, others, token_keys, caps)
+        keys = [k for k in keys if not blocking.is_token(k)]
 
     for key in keys:
         min_len = min_lens.get(key, 0)
@@ -588,6 +667,7 @@ def key_diagnostics(
     split: str, work: Path, data: Path, max_bucket: int | None,
     sample_pairs: int | None, acronym_cap: int | None = None,
     band_cap: int | None = None, acronym_min_len: int = 0,
+    token_cap: int | None = None,
 ) -> None:
     # The caps must be the ones BLOCKING ran with, not the KEY_SPECS defaults.
     # This function used to read the defaults only, so `--acronym-cap 500` (and
@@ -597,7 +677,7 @@ def key_diagnostics(
     # 77.29% while `the bucket cap costs` sat at 1.25% for every point -- a
     # number that cannot move is not a measurement, which is the session-4
     # budget-curve lesson in a third place.
-    caps = resolve_caps(max_bucket, acronym_cap, band_cap)
+    caps = resolve_caps(max_bucket, acronym_cap, band_cap, token_cap)
     keys = list(caps)
     min_lens = {"name_acronym": acronym_min_len} if acronym_min_len > 1 else {}
 
@@ -790,7 +870,7 @@ def miss_report(
     max_bucket: int | None, acronym_cap: int | None, band_cap: int | None,
     acronym_min_len: int, band_min_hits: int, keys: tuple[str, ...] | None,
     n_examples: int, order: str, seed: int, sample_pairs: int | None = None,
-    reason_filter: str = "no-key-agrees",
+    reason_filter: str = "no-key-agrees", token_cap: int | None = None,
 ) -> None:
     """Classify every missed true pair, then print `n_examples` of them.
 
@@ -808,7 +888,7 @@ def miss_report(
     file and will describe the defaults unless told.
     """
     selected = list(keys) if keys is not None else list(blocking.default_keys(None))
-    caps = resolve_caps(max_bucket, acronym_cap, band_cap)
+    caps = resolve_caps(max_bucket, acronym_cap, band_cap, token_cap)
     caps = {k: v for k, v in caps.items() if k in selected}
     min_lens = {"name_acronym": acronym_min_len} if acronym_min_len > 1 else {}
 
@@ -1264,6 +1344,10 @@ def main() -> None:
         help="The --band-cap BLOCKING was run with. See --acronym-cap.",
     )
     p.add_argument(
+        "--token-cap", type=int, default=None,
+        help="The --token-cap BLOCKING was run with. See --acronym-cap.",
+    )
+    p.add_argument(
         "--acronym-min-len", type=int, default=0,
         help="The --acronym-min-len BLOCKING was run with. See --acronym-cap. "
         "It drops a value on BOTH sides before bucketing, so a miss under it "
@@ -1398,7 +1482,7 @@ def main() -> None:
                     a.split, work, data, cand_path, a.max_bucket,
                     a.acronym_cap, a.band_cap, a.acronym_min_len,
                     a.band_min_hits, keys, a.show_misses, a.miss_order,
-                    a.seed, a.sample_pairs, a.miss_reason,
+                    a.seed, a.sample_pairs, a.miss_reason, a.token_cap,
                 )
 
     if not a.no_key_diagnostics:
@@ -1408,7 +1492,8 @@ def main() -> None:
         # the candidate file.
         with progress.stage("eval/key-diagnostics"):
             key_diagnostics(a.split, work, data, a.max_bucket, a.sample_pairs,
-                            a.acronym_cap, a.band_cap, a.acronym_min_len)
+                            a.acronym_cap, a.band_cap, a.acronym_min_len,
+                            a.token_cap)
     progress.shutdown()
 
 

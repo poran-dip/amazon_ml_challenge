@@ -323,7 +323,9 @@ if _TRIGRAM_SOURCE not in NORMALIZED_COLUMNS:
     )
 
 
-def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
+def prepare_full(
+    df: pl.DataFrame, use_translit: bool, strip_noise: bool = True
+) -> pl.DataFrame:
     """Raw rows -> every blocking key plus the address used for scoring.
 
     Unlike `prepare`, no row is dropped here. A record whose name normalizes to
@@ -342,7 +344,8 @@ def prepare_full(df: pl.DataFrame, use_translit: bool) -> pl.DataFrame:
     out = df.select([
         pl.col("entity_id"),
         text_norm.country_expression(),
-        *_pick(text_norm.name_expressions(), *_NAME_KEYS, *_NAME_EXTRA),
+        *_pick(text_norm.name_expressions(strip_noise=strip_noise),
+               *_NAME_KEYS, *_NAME_EXTRA),
         *_pick(text_norm.address_expressions(), *_ADDR_KEYS, *_ADDR_EXTRA),
     ])
     # Second pass, on the MATERIALIZED frame. This is the whole performance
@@ -400,6 +403,12 @@ POLARS_VERSION_KEY = b"amlc_polars_version"
 # that toggles it silently measures the OTHER setting, which is precisely the
 # class of bug this project has hit in sessions 3, 4 and 5.
 TRANSLIT_KEY = b"amlc_translit"
+# Whether the cache was built with the raw-name noise stripper on. Stamped for
+# exactly the reason the translit flag is: toggling it changes every name
+# column without touching a single file, so no mtime guard can see it, and a
+# cache reused across the toggle would mix records normalized two ways —
+# which reads as a recall change caused by the keys rather than by the flag.
+STRIP_NOISE_KEY = b"amlc_strip_noise"
 
 
 # Modules whose contents change what `prepare_full` writes. Adding `minhash`
@@ -462,7 +471,7 @@ def _rule_mtime() -> float:
 
 def _is_fresh(
     parquet: Path, source: Path, expected_rows: int | None,
-    use_translit: bool = False,
+    use_translit: bool = False, strip_noise: bool = True,
 ) -> bool:
     """Whether a cached parquet can be reused.
 
@@ -488,6 +497,7 @@ def _is_fresh(
         meta = pf.schema_arrow.metadata or {}
         stamped = meta.get(POLARS_VERSION_KEY, b"")
         stamped_translit = meta.get(TRANSLIT_KEY)
+        stamped_noise = meta.get(STRIP_NOISE_KEY)
     except Exception:
         return False
     # `name_trigrams` holds polars hash values, and a hash is only meaningful
@@ -506,6 +516,12 @@ def _is_fresh(
         return False
     if stamped_translit != (b"1" if use_translit else b"0"):
         return False
+    # Same treatment as the translit stamp: an unstamped cache predates the
+    # flag and is rebuilt once rather than trusted.
+    if stamped_noise is None:
+        return False
+    if stamped_noise != (b"1" if strip_noise else b"0"):
+        return False
     return expected_rows is None or rows == expected_rows
 
 
@@ -518,6 +534,7 @@ def ensure_normalized(
     force: bool,
     sample: int | None = None,
     sample_targets: int | None = None,
+    strip_noise: bool = True,
 ) -> None:
     """Normalize all three sources to parquet, reusing an up-to-date cache.
 
@@ -548,7 +565,8 @@ def ensure_normalized(
             None if available is None
             else (min(limit, available) if limit else available)
         )
-        if not force and _is_fresh(dst, src, expected, use_translit):
+        if not force and _is_fresh(dst, src, expected, use_translit,
+                                   strip_noise):
             shape = f"{expected:,} rows" if expected is not None else "row count unverified"
             print(f"  source{source}: reusing {dst.name} ({shape})")
             progress.note(f"source{source}: normalization cache HIT",
@@ -570,7 +588,9 @@ def ensure_normalized(
                     block = raw.slice(offset, chunk)
                     if block.is_empty():
                         continue
-                    table = prepare_full(block, use_translit).to_arrow()
+                    table = prepare_full(
+                        block, use_translit, strip_noise
+                    ).to_arrow()
                     # Stamp every chunk, not just the first: the writer is
                     # created from the first chunk's schema and pyarrow requires
                     # each subsequent table's schema to match it, metadata
@@ -578,6 +598,7 @@ def ensure_normalized(
                     table = table.replace_schema_metadata({
                         POLARS_VERSION_KEY: pl.__version__.encode(),
                         TRANSLIT_KEY: b"1" if use_translit else b"0",
+                        STRIP_NOISE_KEY: b"1" if strip_noise else b"0",
                     })
                     if writer is None:
                         writer = pq.ParquetWriter(dst, table.schema,
@@ -1321,6 +1342,16 @@ def main() -> None:
                         "normalization (0.4670) bit-for-bit. A measurement "
                         "reference for attributing a regression to this stage, "
                         "not a supported configuration.")
+    p.add_argument(
+        "--no-strip-noise", action="store_true",
+        help="Keep injected reference markers — `(ID: 84887)`, a trailing "
+        "`#26282` — in the raw name. They survive normalization as ordinary "
+        "tokens and make every name key disagree on a pair whose names are "
+        "otherwise identical, so they are stripped by DEFAULT. This flag "
+        "reproduces the previous normalization, since stripping them moves "
+        "every existing key at once and a regression has to stay "
+        "attributable. See text_norm.NOISE_PATTERNS.",
+    )
     p.add_argument("--translit", action="store_true",
                    help="Romanize Indic script before normalizing. OFF by "
                         "default: measured at +0.0005 macro F_0.5 for +126s on "
@@ -1397,10 +1428,12 @@ def main() -> None:
         print("  normalizing:")
         with progress.stage("normalize", chunk=a.chunk,
                             translit=bool(a.translit and not a.legacy_norm),
+                            strip_noise=not a.no_strip_noise,
                             forced=bool(a.force_normalize)):
             ensure_normalized(
                 a.split, data, work, a.translit and not a.legacy_norm, a.chunk,
                 a.force_normalize, a.sample, a.sample_targets,
+                not a.no_strip_noise,
             )
         if a.normalize_only:
             print(f"  done in {time.perf_counter() - started:.1f}s "

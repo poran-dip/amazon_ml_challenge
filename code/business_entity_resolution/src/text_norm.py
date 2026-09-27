@@ -143,6 +143,56 @@ ADDR_STOPWORDS: tuple[str, ...] = (
 # --------------------------------------------------------------------------
 
 _PUNCT = r"[^\p{L}\p{N}]+"
+
+# Injected reference markers, stripped from the RAW name before punctuation
+# folding. `(ID: 84887)` survives `_base_clean` as two ordinary tokens, `id`
+# and `84887`, which then join `name_sorted`, `name_core`, `name_nospace`,
+# every trigram and the acronym — one record in a true pair carries them and
+# the other does not, so every name key disagrees on a pair whose names are
+# otherwise identical. Four of the first twenty `no-key-agrees` misses read
+# this way.
+#
+# Only mechanical markers are listed. `formerly:`, `née` and `Dr` also appear
+# in the data and are NOT here: those are real variation in how a business is
+# written, and dropping them is a normalization judgement rather than removing
+# an artefact.
+#
+# Applied before punctuation folding because the brackets and the colon are
+# what identify the marker; after folding there is nothing left to match on
+# but a bare number, and bare numbers are load-bearing in this data.
+NOISE_PATTERNS: tuple[str, ...] = (
+    # (ID: 84887) / [id 84887] / (Id#84887)
+    r"(?i)[\(\[\{]\s*id\s*[:#]?\s*\d+\s*[\)\]\}]",
+    # a trailing reference number: "Corp #26282"
+    r"#\s*\d{3,}",
+)
+
+
+def _strip_noise(col: pl.Expr) -> pl.Expr:
+    for pattern in NOISE_PATTERNS:
+        col = col.str.replace_all(pattern, " ")
+    return col
+
+
+# Minimum length for a token to become a blocking value of its own.
+#
+# Short tokens are the ones whose buckets are enormous — a two-letter token has
+# a few hundred possible values across millions of records — and they are also
+# the ones that carry least evidence. This is the `name_acronym --min-len`
+# argument applied at the source rather than as a cap: drop them before
+# bucketing instead of capping the buckets they create. Four keeps `shaw`,
+# `yale`, `boag` and `erin`, which are exactly the rare tokens the token keys
+# exist to find.
+TOKEN_MIN_LEN = 4
+
+# Characters of `name_nospace` that form `name_prefix`.
+#
+# Twelve is long enough that a shared prefix is evidence rather than a
+# coincidence, and short enough to survive a trailing difference. It is the
+# only key that reaches a name concatenated into a domain — `assetbuildingfund`
+# is a SINGLE token, so no token key can match it against `asset building fund
+# care`, while both begin `assetbuildin`.
+PREFIX_LEN = 12
 # ONLY the Latin combining-diacritics block (U+0300-U+036F), never `\p{M}`.
 # In Indic scripts the vowel signs and virama are themselves marks, so a blanket
 # `\p{M}` strip deletes the vowels: डेवलपर्स -> डवलपरस, 33 chars down to 22.
@@ -259,6 +309,37 @@ def _drop_tokens(col: pl.Expr, tokens: tuple[str, ...]) -> pl.Expr:
         col.str.replace_all(pattern, " ")
         .str.replace_all(r"\s+", " ")
         .str.strip_chars()
+    )
+
+
+def _long_tokens(col: pl.Expr, drop_numeric: bool = False) -> pl.Expr:
+    """Unique tokens of at least `TOKEN_MIN_LEN` characters, as a list.
+
+    The value of a token key is not any single token but the SET of them: two
+    records are candidates if they share one rare token, wherever it sits in
+    either name. That is what reaches a pair whose names agree on nothing else
+    — a transliterated name that kept one Latin word, an address that kept one
+    unusual locality — and it is why this returns a list rather than a string.
+
+    No inverse-document-frequency filter here, deliberately. A token's bucket
+    size IS its document frequency, so the bucket cap blocking already applies
+    to every key is exactly an IDF cut, computed against the real corpus at
+    block time rather than guessed at here. `private` lands in a bucket of
+    millions and is dropped; `vaishnavisignature` lands in a bucket of two and
+    survives. Adding a second frequency rule here would be the same cut in a
+    second place, tuned separately, against a different corpus.
+    """
+    keep = pl.element().str.len_chars() >= TOKEN_MIN_LEN
+    if drop_numeric:
+        # Pure digits are covered by `addr_nums`, which applies its own length
+        # rule. Mixed tokens like `4b` or `7b` are NOT dropped here — they are
+        # dropped by the length rule above, which is a different decision and
+        # the reason this does not reuse `_sorted_tokens`.
+        keep = keep & ~pl.element().str.contains(r"^\d+$")
+    return (
+        col.str.split(" ")
+        .list.eval(pl.element().filter(keep))
+        .list.unique()
     )
 
 
@@ -394,19 +475,43 @@ def _acronym(col: pl.Expr) -> pl.Expr:
     )
 
 
-def name_expressions(col: str = "business_name") -> list[pl.Expr]:
-    base = _base_clean(pl.col(col))
+def name_expressions(
+    col: str = "business_name", strip_noise: bool = True
+) -> list[pl.Expr]:
+    """Every name-derived column, from the raw name.
+
+    `strip_noise` removes injected reference markers before anything else —
+    see `NOISE_PATTERNS`. It is a parameter rather than unconditional because
+    it moves every existing key at once, so a regression has to stay
+    attributable to it; `main --no-strip-noise` reproduces the previous
+    normalization exactly.
+    """
+    raw = pl.col(col)
+    if strip_noise:
+        raw = _strip_noise(raw)
+    base = _base_clean(raw)
     norm = _expand(base, LEGAL_ABBREV)
     core = _drop_tokens(norm, LEGAL_TOKENS + WEB_TOKENS)
     # If stripping legal tokens empties the name, fall back to the full form.
     core = pl.when(core.str.len_chars() == 0).then(norm).otherwise(core)
+    nospace = core.str.replace_all(r"\s+", "")
     return [
         norm.alias("name_norm"),
         core.alias("name_core"),
         _sorted_tokens(core).alias("name_sorted"),
-        core.str.replace_all(r"\s+", "").alias("name_nospace"),
+        nospace.alias("name_nospace"),
         _acronym(core).alias("name_acronym"),
         core.str.split(" ").list.len().cast(pl.UInt16).alias("name_token_count"),
+        _long_tokens(core).alias("name_tokens"),
+        # Null below the length, rather than the whole short name. A name
+        # shorter than the prefix would otherwise produce a key identical to
+        # `name_nospace`, which is already a key: every pair it found would be
+        # found twice, and the only effect would be doubling this key's
+        # fan-out and its weight in `block_score`.
+        pl.when(nospace.str.len_chars() >= PREFIX_LEN)
+        .then(nospace.str.slice(0, PREFIX_LEN))
+        .otherwise(None)
+        .alias("name_prefix"),
     ]
     # NOTE: `name_trigrams` is deliberately NOT built here. It is applied in a
     # second pass over the materialized `name_nospace` column — see
@@ -423,6 +528,17 @@ def address_expressions(col: str = "business_address") -> list[pl.Expr]:
         core.alias("addr_core"),
         _sorted_tokens(core, drop_numeric=True).alias("addr_sorted"),
         digits.alias("addr_numbers"),
+        _long_tokens(core, drop_numeric=True).alias("addr_tokens"),
+        # House and postal numbers as blocking values in their own right.
+        # Distinct from `addr_numbers`, which keeps every run of digits
+        # including the single-character ones: `2` is in half the addresses in
+        # the corpus and blocking on it is a full scan of the country.
+        digits.list.eval(
+            pl.element().filter(
+                (pl.element().str.len_chars() >= 3)
+                & (pl.element().str.len_chars() <= 8)
+            )
+        ).list.unique().alias("addr_nums"),
         # Generic postal-code candidates: 4-6 digit runs. Covers US (5),
         # India (6) and France (5) without hard-coding any country.
         digits.list.eval(
