@@ -162,7 +162,19 @@ ADDR_ABBREV: dict[str, str] = {
     "ter": "terrace",
     "hwy": "highway",
     "pkwy": "parkway", "pky": "parkway",
-    "cir": "circle",
+    "cir": "circle", "cirs": "circle",
+    # Street types found missing by reading the addresses of pairs that did
+    # NOT match. `3028 Hidden Forest Cove` against `3028 HIDDEN FOREST CV`
+    # differed on one three-letter abbreviation.
+    "cv": "cove", "cvs": "cove",
+    "trl": "trail", "xing": "crossing", "plz": "plaza",
+    "ctr": "center", "cntr": "center",
+    "grv": "grove", "grn": "green",
+    "hts": "heights", "mnr": "manor", "vw": "view", "vly": "valley",
+    "crk": "creek", "bnd": "bend", "lndg": "landing", "frst": "forest",
+    "rdg": "ridge", "spg": "spring", "spgs": "spring", "mtn": "mountain",
+    "pt": "point", "prk": "park", "cmn": "common", "clb": "club",
+    "est": "estate", "ests": "estate", "trce": "trace", "psge": "passage",
     "apt": "apartment", "apts": "apartment",
     "ste": "suite",
     "fl": "floor", "flr": "floor",
@@ -202,6 +214,88 @@ ADDR_STOPWORDS: tuple[str, ...] = (
     "near", "opposite", "behind", "beside", "next", "to", "the", "at",
     "in", "on", "of", "and", "number",
 )
+
+# Tokens dropped to form `addr_place`: the locality-and-street core of an
+# address, with everything that varies between two records of the same
+# building removed.
+#
+# `addr_sorted` agrees on only 23.48% of true pairs while `addr_tokens` — the
+# same field, one token at a time — agrees on 95.19%. The whole of that gap is
+# tokens that one side carries and the other does not, and reading the missed
+# pairs it is always the same two kinds:
+#
+#   1692 Hill Field Road, Unit Q, Layton, UT  vs  1692 HILL FIELD RD, LAYTON, UT
+#   8080 River Road, South Whitley, IN        vs  8080 River Rd, S Whitley, Indiana
+#
+# a sub-premise marker, and the state written two ways. Neither identifies the
+# building; both break equality. Country is already a hard partition, so the
+# state carries almost no information inside it, and the unit is the one part
+# of an address two records of the same business routinely disagree about.
+SUBPREMISE_TOKENS: tuple[str, ...] = (
+    "unit", "suite", "apartment", "floor", "room", "flat", "door", "gate",
+    "wing", "box", "postal", "boite", "pmb", "cedex", "building", "bldg",
+    "premises", "plot",
+    # Administrative wrappers. `2697 Lavery Court, Thousand Oaks` against
+    # `2697 LAVERY CT, CITY OF THOUSAND OAKS` differs by exactly one of
+    # these, and `of` is already an address stopword.
+    #
+    # `city` is the one real trade here: it drops the distinction between
+    # `Kansas City` and `Kansas`. It is dropped on BOTH sides, so it can only
+    # merge two localities that already share every other token, inside one
+    # country — and it is a blocking key, not a decision. The model still
+    # sees the full `addr_core` through every address feature.
+    "city", "town", "village", "district", "dist", "taluk", "tehsil",
+    "mandal", "county", "province", "region", "state",
+)
+
+# US states, both spellings, plus DC. Written out rather than derived, because
+# there is no list to derive it from and a wrong entry here is a silently
+# looser key rather than an error.
+US_STATE_TOKENS: tuple[str, ...] = (
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+    "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana", "maine",
+    "maryland", "massachusetts", "michigan", "minnesota", "mississippi",
+    "missouri", "montana", "nebraska", "nevada", "ohio", "oklahoma", "oregon",
+    "pennsylvania", "tennessee", "texas", "utah", "vermont", "virginia",
+    "washington", "wisconsin", "wyoming",
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id",
+    "il", "ia", "ks", "ky", "la", "me", "md", "ma", "mi", "mn", "ms", "mo",
+    "mt", "ne", "nv", "oh", "ok", "or", "pa", "ri", "sc", "sd", "tn", "tx",
+    "ut", "vt", "va", "wa", "wv", "wi", "wy", "dc",
+    # Multi-word states arrive as separate tokens after `_base_clean`, and
+    # `new`, `north`, `south` and `west` are all real street words — so only
+    # the distinctive halves are listed. `hampshire`, `jersey`, `mexico` and
+    # `dakota` do not appear in street names; `carolina` and `york` are rare
+    # enough in one to be worth the trade.
+    "hampshire", "jersey", "mexico", "dakota", "carolina", "york",
+)
+
+# Indian states and union territories, plus the abbreviations that appear in
+# this data (`TG` for Telangana, `TN` for Tamil Nadu). `nadu` and `pradesh`
+# are listed so the two-word names fall apart cleanly.
+IN_STATE_TOKENS: tuple[str, ...] = (
+    "andhra", "arunachal", "assam", "bihar", "chhattisgarh", "goa", "gujarat",
+    "haryana", "himachal", "jharkhand", "karnataka", "kerala", "keralam",
+    "madhya", "maharashtra", "manipur", "meghalaya", "mizoram", "nagaland",
+    "odisha", "orissa", "punjab", "rajasthan", "sikkim", "tamil", "telangana",
+    "tripura", "uttarakhand", "uttar", "bengal", "delhi", "puducherry",
+    "pondicherry", "chandigarh", "ladakh", "lakshadweep", "andaman",
+    "nicobar", "nadu", "pradesh",
+    "tg", "tn", "ap", "ka", "kl", "mh", "up", "wb", "gj", "rj", "mp", "hr",
+    "pb", "br", "od", "as", "jk", "hp", "uk", "cg", "ts",
+)
+
+# A handful of these (`ct`, `fl`, `mt`, `ne`) are also ADDR_ABBREV keys, and
+# that is not a conflict: expansion runs BEFORE this drop, so `CT` is already
+# `court` and is never considered as Connecticut. The effect is that those
+# four states are not removed — applied identically to both sides of every
+# pair, so equality is unaffected, and the alternative (expanding them as
+# states) would break far more real street names than it fixed.
+PLACE_STOPWORDS: tuple[str, ...] = (
+    SUBPREMISE_TOKENS + US_STATE_TOKENS + IN_STATE_TOKENS
+)
+
 
 # --------------------------------------------------------------------------
 # Expression builders
@@ -408,7 +502,9 @@ def _long_tokens(col: pl.Expr, drop_numeric: bool = False) -> pl.Expr:
     )
 
 
-def _sorted_tokens(col: pl.Expr, drop_numeric: bool = False) -> pl.Expr:
+def _sorted_tokens(
+    col: pl.Expr, drop_numeric: bool = False, min_len: int = 0
+) -> pl.Expr:
     """Order-invariant token signature: unique tokens, sorted, space-joined.
 
     Collapses word-order transpositions ("Sharma Traders" / "Traders Sharma").
@@ -418,6 +514,8 @@ def _sorted_tokens(col: pl.Expr, drop_numeric: bool = False) -> pl.Expr:
     a flat digit-strip would turn `4b` into `b` and destroy a strong signal.
     """
     keep = pl.element().str.len_chars() > 0
+    if min_len > 1:
+        keep = keep & (pl.element().str.len_chars() >= min_len)
     if drop_numeric:
         keep = keep & ~pl.element().str.contains(r"^\d+$")
     return (
@@ -635,6 +733,18 @@ def address_expressions(col: str = "business_address") -> list[pl.Expr]:
         norm.alias("addr_norm"),
         core.alias("addr_core"),
         _sorted_tokens(core, drop_numeric=True).alias("addr_sorted"),
+        # The street-and-locality core: `addr_sorted` with sub-premise markers
+        # and state names removed, and single characters dropped (a bare `q`
+        # is a unit label, never a place).
+        #
+        # A NEW key rather than a change to `addr_sorted` or `addr_core`,
+        # deliberately. Those two feed the scorer's address features, and
+        # loosening them would move every address feature the model was fitted
+        # on at the same time as adding reach — two changes in one, neither
+        # attributable. This only adds a key.
+        _sorted_tokens(
+            _drop_tokens(core, PLACE_STOPWORDS), drop_numeric=True, min_len=2
+        ).alias("addr_place"),
         digits.alias("addr_numbers"),
         _long_tokens(core, drop_numeric=True).alias("addr_tokens"),
         # House and postal numbers as blocking values in their own right.

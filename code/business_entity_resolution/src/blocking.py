@@ -209,6 +209,12 @@ KEY_SPECS: tuple[tuple[str, float, int], ...] = (
     # ranking, which is the intended order — an exact name match should never
     # be displaced by an anagram of it.
     ("name_charsort", 0.60, 2000),
+    # Strong evidence and, on this data, the most agreed-upon field there is:
+    # `addr_tokens` agrees on 95.19% of true pairs one token at a time, and
+    # this is the exact-match version of the same field with the tokens that
+    # break equality removed. Weighted just under `addr_sorted`, which is
+    # strictly stricter and therefore strictly better evidence when it fires.
+    ("addr_place", 0.80, 2000),
 )
 
 KEY_COLUMNS: tuple[str, ...] = tuple(k for k, _, _ in KEY_SPECS)
