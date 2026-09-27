@@ -128,6 +128,12 @@ BAND_KEYS: tuple[str, ...] = minhash.band_columns(N_BANDS)
 BAND_WEIGHT = 0.10
 BAND_CAP = 100
 
+# Default bucket cap for the token keys. Tighter than the name keys' 2,000 by
+# two orders of magnitude, because a token key's fan-out is multiplied by the
+# number of tokens per record and because its whole purpose is the RARE
+# tokens: a token in a bucket of 500 is a word, not a name.
+TOKEN_CAP = 40
+
 # (column, weight, bucket cap).
 #
 # Weights and caps were derived from per-key diagnostics measured under the
@@ -160,6 +166,33 @@ KEY_SPECS: tuple[tuple[str, float, int], ...] = (
     # candidate or feature parquet stays readable, and the diagnostics in
     # `findings.md` that quote per-key contributions stay comparable.
     *((k, BAND_WEIGHT, BAND_CAP) for k in BAND_KEYS),
+    # Token keys, appended after the bands for the same reason the bands were
+    # appended after the exact keys.
+    #
+    # These are MULTI-VALUED: the normalized column is a list, and a record
+    # joins one bucket per token rather than one bucket in total. That is the
+    # whole point — a pair is reachable if it shares ONE rare token, wherever
+    # that token sits in either string — and it is why the cap matters more
+    # here than anywhere else. Fan-out is (tokens per record) x (bucket size),
+    # so it is the product of two numbers rather than one, and `projected_pairs`
+    # is exact and checked before a row is written.
+    #
+    # The cap doubles as the inverse-document-frequency cut. A token's bucket
+    # size IS its document frequency in the target corpus, so `private` and
+    # `road` are dropped by the same rule that keeps `vaishnavisignature` and
+    # `boag`, computed against the real data rather than a stop-word list
+    # someone has to maintain.
+    ("name_tokens", 0.30, TOKEN_CAP),
+    ("addr_tokens", 0.30, TOKEN_CAP),
+    # Weaker than the two above: a shared house or postal number is real
+    # evidence but a weaker kind, and it is the one token key whose values are
+    # drawn from a small alphabet.
+    ("addr_nums", 0.15, TOKEN_CAP),
+    # Single-valued, and the complement of `name_tokens` rather than a
+    # duplicate of it: a name concatenated into a domain
+    # (`assetbuildingfund`) is ONE token and shares none with `asset building
+    # fund care`, while the two agree on their first twelve characters.
+    ("name_prefix", 0.75, 2000),
 )
 
 KEY_COLUMNS: tuple[str, ...] = tuple(k for k, _, _ in KEY_SPECS)
@@ -176,6 +209,47 @@ EXACT_KEYS: tuple[str, ...] = tuple(k for k in KEY_COLUMNS if k not in BAND_KEYS
 # keys by prefix.
 def is_band(key: str) -> bool:
     return key.startswith(minhash.BAND_PREFIX)
+
+
+# Keys whose normalized column is a LIST of values rather than one value.
+#
+# Named explicitly rather than inferred from the parquet schema, for the
+# reason `is_band` is: every place that has to branch on this needs the answer
+# before it has a frame in hand, and a schema lookup there would be a read of
+# a file that may not exist yet.
+TOKEN_KEYS: tuple[str, ...] = ("name_tokens", "addr_tokens", "addr_nums")
+
+
+def is_token(key: str) -> bool:
+    return key in TOKEN_KEYS
+
+
+def _maybe_explode(lf: pl.LazyFrame, key: str) -> pl.LazyFrame:
+    """One row per (record, token) for a token key; unchanged otherwise.
+
+    Exploding here — before `_usable` and before `blocking_key` — is what
+    makes a multi-valued key need no other change anywhere. Downstream, an
+    exploded row is indistinguishable from a single-valued key's row: the
+    bucket census counts records per token (which is the token's document
+    frequency, exactly what the cap wants to cut on), `projected_pairs` stays
+    exact because every row still joins exactly one bucket, and the merge's
+    `key_bit.n_unique()` collapses a pair that shares several tokens back to
+    one bit.
+
+    The one thing that does NOT collapse is `block_score`, which sums `w` over
+    rows: a pair sharing three rare tokens scores three times one sharing one.
+    That is intended and is the same additive shape the bands already have —
+    more independent agreements is more evidence — and it is bounded by the
+    token count, which `name_token_count` records.
+    """
+    # `empty_as_null=False` explicitly. A record whose token list is empty
+    # currently explodes to one NULL row, which `_usable` then drops — the
+    # right outcome by an accident of the default. Polars 2.0 flips that
+    # default to producing no row at all, which is the SAME outcome by
+    # construction, and stating it here means the behaviour does not depend on
+    # which polars is installed. Not stating it is how the journal's
+    # `empty_as_null` entry in `ground_truth_pairs` came to be written.
+    return lf.explode(key, empty_as_null=False) if is_token(key) else lf
 
 # Which key found a pair, as one bit per key in a `key_mask` column.
 #
@@ -214,19 +288,29 @@ assert len(set(KEY_COLUMNS)) == len(KEY_COLUMNS), (
 )
 KEY_BITS: dict[str, int] = {k: 1 << i for i, k in enumerate(KEY_COLUMNS)}
 
-# Lowest key_mask bit belonging to a band. Bands are appended last in
-# KEY_SPECS, so every band bit is at or above this and every exact-key bit is
-# below it. That contiguity is what lets `_merge` count band agreements with a
-# comparison on the bit VALUE instead of a popcount, which polars has no
-# expression for.
-BAND_BIT_FLOOR: int = min(
-    (KEY_BITS[k] for k in BAND_KEYS), default=1 << len(KEY_COLUMNS)
-)
-assert all(KEY_BITS[k] < BAND_BIT_FLOOR for k in EXACT_KEYS), (
-    "an exact key has a bit at or above BAND_BIT_FLOOR — the band bits are no "
-    "longer contiguous at the top, and --band-min-hits would miscount. Append "
-    "new exact keys BEFORE the bands in KEY_SPECS, or replace the comparison "
-    "in _merge with a real popcount."
+# Which bits belong to the bands, as a mask.
+#
+# This REPLACES a `>= BAND_BIT_FLOOR` comparison that relied on the band bits
+# being contiguous at the top of the mask. They no longer are: the token keys
+# are appended after the bands, deliberately, so that every band's bit keeps
+# the value it had and an existing candidate or feature parquet stays
+# readable. The old assertion fired the moment they were added and said to
+# either move them below the bands or replace the comparison with a real
+# popcount — this is that replacement, and it is the cheaper of the two,
+# because moving them would renumber sixteen band bits to avoid renumbering
+# nothing.
+#
+# A `key_bit` is always a single bit, so `bit & BAND_MASK != 0` is exactly
+# "this bit is a band's", with no ordering assumption at all. `_merge` needs
+# only that test, never a popcount over an arbitrary mask.
+BAND_MASK: int = 0
+for _k in BAND_KEYS:
+    BAND_MASK |= KEY_BITS[_k]
+del _k
+EXACT_MASK: int = ((1 << len(KEY_COLUMNS)) - 1) & ~BAND_MASK
+assert BAND_MASK & EXACT_MASK == 0, "a key is both a band and not a band"
+assert BAND_MASK | EXACT_MASK == (1 << len(KEY_COLUMNS)) - 1, (
+    "every key must be on exactly one side of the band split"
 )
 
 # `name_core` is measured redundant and is excluded from blocking by default.
@@ -339,8 +423,11 @@ def _target_table(
     """
     sources = pl.concat(
         [
-            pl.scan_parquet(paths.normalized_parquet(split, s, work))
-            .select("entity_id", "country_norm", key)
+            _maybe_explode(
+                pl.scan_parquet(paths.normalized_parquet(split, s, work))
+                .select("entity_id", "country_norm", key),
+                key,
+            )
             .filter(_usable(key, min_len))
             .select(
                 pl.col("entity_id").alias("candidate_entity_id"), blocking_key(key)
@@ -395,7 +482,7 @@ def _s1_for_key(s1_all: pl.DataFrame, key: str, min_len: int) -> pl.DataFrame:
     already in memory.
     """
     return (
-        s1_all.lazy()
+        _maybe_explode(s1_all.lazy(), key)
         .filter(_usable(key, min_len))
         .select(pl.col("entity_id").alias("source1_entity_id"), blocking_key(key))
         .collect()
@@ -634,13 +721,15 @@ def _merge(
                 pl.col("key_bit").unique().sum().cast(KEY_MASK_DTYPE)
                 .alias("key_mask"),
                 # How many DISTINCT bands found this pair, and whether any
-                # exact key did. Both are counted off the bit value, which
-                # works because the band bits are contiguous at the top (see
-                # BAND_BIT_FLOOR).
-                pl.col("key_bit").filter(pl.col("key_bit") >= BAND_BIT_FLOOR)
-                .n_unique().cast(pl.UInt8).alias("n_bands"),
-                pl.col("key_bit").filter(pl.col("key_bit") < BAND_BIT_FLOOR)
-                .n_unique().cast(pl.UInt8).alias("n_exact"),
+                # non-band key did. Both are counted by masking the bit, which
+                # needs no assumption about where the band bits sit (see
+                # BAND_MASK).
+                pl.col("key_bit").filter(
+                    (pl.col("key_bit") & BAND_MASK) > 0
+                ).n_unique().cast(pl.UInt8).alias("n_bands"),
+                pl.col("key_bit").filter(
+                    (pl.col("key_bit") & EXACT_MASK) > 0
+                ).n_unique().cast(pl.UInt8).alias("n_exact"),
             )
             .collect()
         )
@@ -999,6 +1088,8 @@ def block_split(
     prefix_max_bucket: int = 500,
     tfidf: bool = False,
     tfidf_top_k: int = 20,
+    *,
+    token_cap: int | None = None,
 ) -> Path:
     """Run stage A end to end and return the candidate parquet's path.
 
@@ -1111,6 +1202,14 @@ def block_split(
                 min_len = acronym_min_len
             elif is_band(key):
                 cap = band_cap or cap
+                min_len = 0
+            elif is_token(key):
+                # The token keys share ONE knob. They are the same mechanism
+                # applied to three fields, their fan-out scales the same way,
+                # and three separate flags would be three numbers to keep in
+                # step across a sweep — the `--band-cap` argument for one
+                # shared band cap, for the same reason.
+                cap = token_cap or cap
                 min_len = 0
             else:
                 min_len = 0
@@ -1252,6 +1351,18 @@ def main() -> None:
         "5.81%% survive, so the cap is discarding 54.77%% of what it finds.",
     )
     p.add_argument(
+        "--token-cap", type=int, default=None,
+        help=f"Bucket cap for every token key — name_tokens, addr_tokens, "
+        f"addr_nums (default: their KEY_SPECS value, {TOKEN_CAP}). This is "
+        "the fan-out knob for them and it is also their IDF cut: a token's "
+        "bucket size IS its document frequency, so lowering this drops more "
+        "common words and raises the share of true pairs reached only "
+        "through a genuinely rare one. Fan-out is (tokens per record) x "
+        "(bucket size), so it grows faster in this cap than a single-valued "
+        "key's does — check the projected pair count, which is exact and "
+        "printed before anything is written.",
+    )
+    p.add_argument(
         "--acronym-min-len", type=int, default=0,
         help="Drop acronyms shorter than this before blocking on them. Bucket "
         "size and acronym length are directly related, so this removes the "
@@ -1307,6 +1418,7 @@ def main() -> None:
             a.acronym_cap, a.acronym_min_len, a.bands if keys is None else None,
             a.band_min_hits, a.band_cap, a.max_pairs_per_key or None,
             a.max_pairs_total or None,
+            token_cap=a.token_cap,
         )
     progress.shutdown()
 
